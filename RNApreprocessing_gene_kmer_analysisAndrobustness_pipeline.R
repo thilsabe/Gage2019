@@ -31,19 +31,16 @@ suppressPackageStartupMessages({
 first <- data.table::first
 last  <- data.table::last
 
-# Setting memory usage per core for future.apply (adjust as needed for your HPC environment)
-options(future.globals.maxSize = 1000 * 1024^2)  # 500MB per worker
-
 # ============================================================
 # 0. CONFIGURATION
 # ============================================================
 
-n_cores <- 24      # increase to 32 for full HPC runs
+n_cores <- 12      # increase to 32 for full HPC runs
 testrun <- FALSE   # set FALSE for full production run
 handlers("txtprogressbar")
 
 # Input paths
-deg_sets_dir       <- "/cjc/data/Gage_align_bamFiles/count_DEG_analysis/WithConfounds/HOMER/overlap_DEGs"#DEG_sets"
+deg_sets_dir       <- "/cjc/data/Gage_align_bamFiles/count_DEG_analysis/WithConfounds/HOMER/overlap_DEGs/DEG_sets"
 kmer_deseq_dir     <- "/netapp/snl/scratch25/AHAllen_projects/Gage2019/kmerator_results/deseq2_results"
 kmer_map_file      <- "kmer_rMATS_annotations/kmer_gene_map_from_gtf_20260222.csv"
 kmer_features_file <- "kmer_features/kmer_splice_motif_position_features_20260222.csv"
@@ -122,34 +119,23 @@ parse_metadata <- function(fname) {
                                  ifelse(grepl("counters", fname), "counter", "unknown")))
   
   # Extract raw fixed value string from "within_<value>"
-  within_idx  <- which(parts == "within")
+  within_idx <- which(parts == "within")
   fixed_value <- if (length(within_idx) > 0 && within_idx + 1 <= length(parts)) {
-    # Rejoin remaining parts after "within"
     remaining <- paste(parts[(within_idx + 1):length(parts)], collapse="_")
-    # Strip .csv extension first, then trailing date
-    remaining <- gsub("\\.csv$", "", remaining)
-    remaining <- sub("_\\d{2}-\\d{2}-\\d{4}$", "", remaining)
-    remaining
+    # Strip trailing date (e.g. _11-11-2025)
+    sub("_?\\d{2}-\\d{2}-\\d{4}$", "", remaining)
   } else {
     NA_character_
   }
   
   # Identify what is fixed by matching fixed_value against ALL known dimension lists
   # Do NOT assume — a counters file could fix an aligner OR a trimmer
-  matched_trimmer <- if (grouping_type != "trimmer") {
-    trimmers[sapply(trimmers, function(t)
-      grepl(paste0("(^|_)", t, "(_|$)"), fixed_value))]
-  } else character(0)
-  
-  matched_aligner <- if (grouping_type != "aligner") {
-    aligners[sapply(aligners, function(a)
-      grepl(paste0("(^|_)", a, "(_|$)"), fixed_value))]
-  } else character(0)
-  
-  matched_counter <- if (grouping_type != "counter") {
-    counters[sapply(counters, function(c)
-      grepl(paste0("(^|_)", c, "(_|$)"), fixed_value))]
-  } else character(0)
+  matched_trimmer <- trimmers[sapply(trimmers, function(t)
+    grepl(paste0("(^|_)", t, "(_|$)"), fixed_value))]
+  matched_aligner <- aligners[sapply(aligners, function(a)
+    grepl(paste0("(^|_)", a, "(_|$)"), fixed_value))]
+  matched_counter <- counters[sapply(counters, function(c)
+    grepl(paste0("(^|_)", c, "(_|$)"), fixed_value))]
   
   # Take longest match first to handle overlapping names
   # (e.g. homer_gene_condensed_unique before homer_gene)
@@ -221,32 +207,16 @@ load_deg_aligners <- function(deg_file) {
 # 4. MATCH KMER FILE
 # ============================================================
 
-match_kmer_file <- function(deg_file, fastq_trimmer=NULL) {
-  new_name      <- sub("\\.csv$", "_AD_vs_CTRL.csv", basename(deg_file))
-  new_name      <- gsub("-", "_", new_name)   # converts ALL hyphens including date
-  base_name     <- sub("_AD_vs_CTRL\\.csv$", ".csv",     new_name)
-  filtered_name <- sub("_AD_vs_CTRL\\.csv$", ".csv.zst", new_name)
-  
-  # If fastq_trimmer is NULL/NA, return paths for all known trimmers
-  trimmers_to_use <- if (is.null(fastq_trimmer) || all(is.na(fastq_trimmer))) {
-    trimmers
-  } else {
-    fastq_trimmer
-  }
-  
-  # Build named list of path triplets, one per trimmer
-  paths <- lapply(trimmers_to_use, function(t) {
-    list(
-      deseq2     = file.path(kmer_deseq_dir,
-                             paste0("kmc_deseq2_",     t, "_", new_name)),
-      postfilter = file.path(kmer_deseq_dir,
-                             paste0("kmc_postfilter_", t, "_", base_name)),
-      filtered   = file.path(kmer_deseq_dir,
-                             paste0("kmc_filtered_",   t, "_", filtered_name))
-    )
-  })
-  names(paths) <- trimmers_to_use
-  return(paths)
+match_kmer_file <- function(deg_file, fastq_trimmer) {
+  new_name <- sub("\\.csv$", "_AD_vs_CTRL.csv", basename(deg_file))
+  new_name <- gsub("-", "_", new_name)
+  list(
+    deseq2   = file.path(kmer_deseq_dir, paste0("kmc_deseq2_",     fastq_trimmer, "_", new_name)),
+    postfilter = file.path(kmer_deseq_dir, paste0("kmc_postfilter_", fastq_trimmer, "_", 
+                                                  sub("_AD_vs_CTRL\\.csv$", ".csv", new_name))),
+    filtered   = file.path(kmer_deseq_dir, paste0("kmc_filtered_",   fastq_trimmer, "_", 
+                                                  sub("_AD_vs_CTRL\\.csv$", ".csv.zst", new_name)))
+  )
 }
 
 # ============================================================
@@ -511,34 +481,8 @@ if (file.exists(symbol_lookup_file) && file.exists(transcript_lookup_file)) {
 # 7. MAIN LOADING + PER-DEG-SET ANALYSIS LOOP
 # ============================================================
 
-# Priority DEG lists to process first — stripped of .csv suffix for consistency
-priority_deg_lists <- c(
-  "all_DEGs_aligners_within_fastp_11-11-2025",
-  "all_DEGs_aligners_within_trimmomatic_11-11-2025",
-  "all_DEGs_aligners_within_trimgalore_11-11-2025",
-  "all_DEGs_aligners_within_fastp_homer_gene_11-11-2025",
-  "all_DEGs_aligners_within_fastp_htseq_11-11-2025",
-  "all_DEGs_aligners_within_fastp_homer_exon_11-11-2025",
-  "all_DEGs_aligners_within_trimmomatic_homer_gene_11-11-2025",
-  "all_DEGs_aligners_within_trimmomatic_htseq_11-11-2025",
-  "all_DEGs_aligners_within_trimmomatic_homer_exon_11-11-2025",
-  "all_DEGs_aligners_within_trimgalore_homer_gene_11-11-2025",
-  "all_DEGs_aligners_within_trimgalore_htseq_11-11-2025",
-  "all_DEGs_aligners_within_trimgalore_homer_exon_11-11-2025",
-  "all_DEGs_trimmers_within_gsnap_11-11-2025",
-  "all_DEGs_trimmers_within_gsnap_2024genome_11-11-2025",
-  "all_DEGs_trimmers_within_hisat2_11-11-2025",
-  "all_DEGs_trimmers_within_star_single_11-11-2025",
-  "all_DEGs_trimmers_within_star_twopass_11-11-2025"
-)
-
 deg_files <- list.files(deg_sets_dir, pattern="^all_DEGs_.*\\.csv$", full.names=TRUE)
 cat("Found", length(deg_files), "DEG files\n")
-
-# Filter to priority list only
-priority_deg_files <- paste0(priority_deg_lists, ".csv")
-deg_files <- deg_files[basename(deg_files) %in% priority_deg_files]
-cat("After priority filter:", length(deg_files), "DEG files\n")
 
 if (testrun) {
   deg_files <- deg_files[seq(1, length(deg_files), by=5)][1:3]
@@ -560,15 +504,12 @@ subkmer_results_all    <- list()
 for (deg_file in deg_files) {
 
   meta     <- parse_metadata(deg_file)
-  meta <- lapply(meta, function(x) if (is.null(x)) NA_character_ else x)
   deg_name <- gsub("\\.csv$", "", basename(deg_file))
 
   cat("\n============================================================\n")
   cat("Processing:", deg_name, "\n")
-  cat("  fastq_trimmer   :", meta$fastq_trimmer    %||% "NA", "\n")
-  cat("  deg_list_trimmer:", meta$deg_list_trimmer  %||% "NA", "\n")
-  cat("  deg_list_aligner:", meta$deg_list_aligner  %||% "NA", "\n")
-  cat("  fixed_value     :", meta$fixed_value       %||% "NA", "\n")
+  cat("  fastq_trimmer   :", meta$fastq_trimmer,    "\n")
+  cat("  deg_list_trimmer:", meta$deg_list_trimmer,  "\n")
   cat("  counter         :", meta$counter,           "\n")
   cat("  grouping_type   :", meta$grouping_type,     "\n")
 
@@ -616,70 +557,22 @@ for (deg_file in deg_files) {
   # Load kmer DESeq2 files for each FASTQ trimmer
   # ----------------------------------------------------------
   kmer_dt_list <- list()
-  
-  # Always try all trimmers — the kmer stability analysis requires
-  # data from all trimmers regardless of which dimension is varying.
-  # For aligner-grouping files this means loading the same DEG gene
-  # list against all FASTQ trimmer kmer results.
-  # For trimmer-grouping files this naturally captures all trimmers.
-  trimmers_to_try <- trimmers
-  
-  # Add this diagnostic before the kmer loading loop
-  cat("  Expected deseq2 path pattern:\n")
-  for (t in trimmers) {
-    test_path <- match_kmer_file(deg_file, t)
-    cat(sprintf("    %s:\n      deseq2: %s\n", t, test_path[[t]]$deseq2))
-  }
-  cat("  Actual files in deseq2_results matching this deg:\n")
-  deg_name_safe <- gsub("-", "_", gsub("\\.csv$", "", basename(deg_file)))
-  actual <- Sys.glob(file.path(kmer_deseq_dir,
-                               paste0("*", deg_name_safe, "*")))
-  for (f in actual) cat(sprintf("    %s\n", f))
-  
-  kmer_paths <- match_kmer_file(deg_file, trimmers_to_try)
-  
-  for (fastq_trimmer in names(kmer_paths)) {
-    paths <- kmer_paths[[fastq_trimmer]]
-    
-    kmer_file_match <- Sys.glob(sub("\\.csv$", "*.csv", paths$deseq2))
-    
+  for (fastq_trimmer in trimmers) {
+    kmer_file       <- match_kmer_file(deg_file, fastq_trimmer)
+    kmer_file_match <- Sys.glob(sub("\\.csv$", "*.csv", kmer_file$deseq2))
     if (length(kmer_file_match) == 0) {
-      cat(sprintf("  [INFO] deseq2 not found for trimmer=%s, trying postfilter\n",
-                  fastq_trimmer))
-      kmer_file_match <- Sys.glob(sub("\\.csv$", "*.csv", paths$postfilter))
-    }
-    
-    if (length(kmer_file_match) == 0) {
-      cat(sprintf("  [SKIP] No kmer files found for trimmer=%s\n", fastq_trimmer))
+      cat("  [SKIP] kmer file not found:", kmer_file, "\n")
       next
     }
-    
-    tryCatch({
-      dt <- fread(kmer_file_match[1])
-      dt[, fastq_trimmer    := fastq_trimmer]
-      dt[, kmer_source_file := basename(kmer_file_match[1])]
-      dt[, kmer_source_type := ifelse(grepl("deseq2",    basename(kmer_file_match[1])),
-                                      "deseq2",
-                                      ifelse(grepl("postfilter", basename(kmer_file_match[1])),
-                                             "postfilter", "other"))]
-      kmer_dt_list[[fastq_trimmer]] <- dt
-      cat(sprintf("  [OK] Loaded %s file for trimmer=%s: %d rows\n",
-                  dt$kmer_source_type[1], fastq_trimmer, nrow(dt)))
-    }, error = function(e) {
-      cat(sprintf("  [WARNING] Failed to load kmer file for trimmer=%s: %s\n",
-                  fastq_trimmer, e$message))
-    })
+    dt <- fread(kmer_file_match[1])
+    dt[, fastq_trimmer := fastq_trimmer]
+    kmer_dt_list[[fastq_trimmer]] <- dt
   }
-  
+
   if (length(kmer_dt_list) == 0) {
-    cat(sprintf("  [SKIP] No kmer files found for %s — continuing to next DEG set\n",
-                deg_name))
+    cat("  [SKIP] No kmer files found for", deg_name, "\n")
     next
   }
-  
-  cat(sprintf("  Loaded kmer data for %d/%d trimmer(s): %s\n",
-              length(kmer_dt_list), length(trimmers),
-              paste(names(kmer_dt_list), collapse=", ")))
 
   kmer_dt <- rbindlist(kmer_dt_list, fill=TRUE)
 
@@ -788,10 +681,6 @@ for (deg_file in deg_files) {
     next
   }
 
-  cat("  Assigning metadata to merged...\n")
-  cat("  nrow(merged) before := :", nrow(merged), "\n")
-  cat("  meta$fixed_value:", meta$fixed_value %||% "NULL", "\n")
-  
   merged[, `:=`(
     grouping_type    = meta$grouping_type,
     fixed_value      = meta$fixed_value,
@@ -807,9 +696,6 @@ for (deg_file in deg_files) {
     gene_specific    = ensembl_id %in% deg_dt$ensembl_id
   )]
   
-  cat("  fixed_value assigned:", unique(merged$fixed_value), "\n")
-  cat("  method assigned     :", unique(merged$method), "\n")
-  
   # Verify no NAs in method before split
   cat("  NA methods:", sum(is.na(merged$method)), "\n")
   cat("  Unique methods:", uniqueN(merged$method), "\n")
@@ -824,37 +710,12 @@ for (deg_file in deg_files) {
   
   full_dataset[[deg_name]]           <- merged
   gene_tracker[[deg_name]]           <- unique(merged$ensembl_id)
-  ## Build upset_group from ALL available varying dimensions combined
-  # so UpSet shows full combinatorial intersections across aligner x trimmer x counter
-  merged[, upset_group := paste(
-    ifelse(!is.na(aligner)       & aligner       != "", aligner,       ""),
-    ifelse(!is.na(fastq_trimmer) & fastq_trimmer != "", fastq_trimmer, ""),
-    ifelse(!is.na(counter)       & counter       != "", counter,       ""),
-    sep="_"
-  )]
-  merged[, upset_group := gsub("_+", "_", gsub("^_|_$", "", upset_group))]
-  
   kmers_by_method[[deg_name]] <- lapply(
-    split(merged$kmer, merged$upset_group), unique)
-  kmers_by_method[[deg_name]] <- kmers_by_method[[deg_name]][
-    sapply(kmers_by_method[[deg_name]], length) > 0]
-  
-  all_kmer_gene_lists[[deg_name]] <- lapply(
-    split(merged$ensembl_id, merged$upset_group), unique)
-  
-  # Always split by aligner alone for aligner-specific downstream analyses
-  all_kmer_aligner_lists[[deg_name]] <- lapply(
-    split(merged$ensembl_id, merged$aligner[!is.na(merged$aligner)]), unique)
-  
-  cat(sprintf("  Method sets for UpSet/discordant: %d groups\n",
-              length(kmers_by_method[[deg_name]])))
-  cat(sprintf("  Groups: %s\n",
-              paste(names(kmers_by_method[[deg_name]]), collapse=", ")))
-  
-  # aligner lists — always split by aligner regardless of grouping type
-  # since aligner is always present as a column from deg_dt
-  all_kmer_aligner_lists[[deg_name]] <- lapply(
-    split(merged$ensembl_id, merged$aligner), unique)
+    split(merged$kmer, merged$method),
+    unique
+  )
+  all_kmer_gene_lists[[deg_name]]    <- split(merged$ensembl_id,   merged$method)
+  all_kmer_aligner_lists[[deg_name]] <- split(merged$ensembl_id,   merged$aligner)
 
   deg_out <- file.path(output_dir, deg_name)
   dir.create(deg_out, recursive=TRUE, showWarnings=FALSE)
@@ -877,10 +738,8 @@ for (deg_file in deg_files) {
       n_kmers = uniqueN(kmer),
       n_rows  = .N
     ), by=.(fixed_value, aligner)]
-    fastq_sens[, genes_norm    := n_genes / max(n_genes, na.rm=TRUE)]
-    fastq_sens[, kmers_norm    := n_kmers / max(n_kmers, na.rm=TRUE)]
-    fastq_sens[, varying_value := aligner]
-    fastq_sens[, grouping_type := "aligner"]
+    fastq_sens[, genes_norm := n_genes / max(n_genes, na.rm=TRUE)]
+    fastq_sens[, kmers_norm := n_kmers / max(n_kmers, na.rm=TRUE)]
     fwrite(fastq_sens,
            file.path(deg_out, paste0("fastq_trimmer_sensitivity_vs_deglist_trimmer_",
                                      today, ".csv")))
@@ -900,10 +759,8 @@ for (deg_file in deg_files) {
       n_kmers = uniqueN(kmer),
       n_rows  = .N
     ), by=.(fixed_value, fastq_trimmer)]
-    trimmer_sens[, genes_norm    := n_genes / max(n_genes, na.rm=TRUE)]
-    trimmer_sens[, kmers_norm    := n_kmers / max(n_kmers, na.rm=TRUE)]
-    trimmer_sens[, varying_value := fastq_trimmer]
-    trimmer_sens[, grouping_type := "trimmer"]
+    trimmer_sens[, genes_norm := n_genes / max(n_genes, na.rm=TRUE)]
+    trimmer_sens[, kmers_norm := n_kmers / max(n_kmers, na.rm=TRUE)]
     fwrite(trimmer_sens,
            file.path(deg_out, paste0("trimmer_sensitivity_vs_fixed_aligner_",
                                      today, ".csv")))
@@ -923,10 +780,8 @@ for (deg_file in deg_files) {
       n_kmers = uniqueN(kmer),
       n_rows  = .N
     ), by=.(fixed_value, counter)]
-    counter_sens[, genes_norm    := n_genes / max(n_genes, na.rm=TRUE)]
-    counter_sens[, kmers_norm    := n_kmers / max(n_kmers, na.rm=TRUE)]
-    counter_sens[, varying_value := counter]
-    counter_sens[, grouping_type := "counter"]
+    counter_sens[, genes_norm := n_genes / max(n_genes, na.rm=TRUE)]
+    counter_sens[, kmers_norm := n_kmers / max(n_kmers, na.rm=TRUE)]
     fwrite(counter_sens,
            file.path(deg_out, paste0("counter_sensitivity_vs_fixed_dim_",
                                      today, ".csv")))
@@ -1050,11 +905,11 @@ for (deg_file in deg_files) {
     # Prefer postfilter (DESeq2-normalized, same detectability threshold as foreground)
     # Fall back to kmer_dt itself if outputs not found
     
-    if (file.exists(paths$postfilter) && file.exists(paths$deseq2)) {
+    if (file.exists(kmer_file$postfilter) && file.exists(kmer_file$deseq2)) {
       cat("  Loading DESeq2 script outputs as background controls...\n")
-      deseq2_res_bg    <- fread(paths$deseq2)
+      deseq2_res_bg    <- fread(kmer_file$deseq2)
       background_kmers <- deseq2_res_bg[is.na(padj) | padj >= 0.05, kmer]
-      postfilter_wide  <- fread(paths$postfilter)
+      postfilter_wide  <- fread(kmer_file$postfilter)
       kmer_bg          <- postfilter_wide[kmer %in% background_kmers, .(kmer)]
       cat(sprintf("  Background: %d non-sig k-mers (postfilter, padj>=0.05 or NA)\n", nrow(kmer_bg)))
     } else {
@@ -1122,178 +977,6 @@ for (deg_file in deg_files) {
   } else {
     cat("  [SKIP] No significant kmers for motif enrichment\n")
   }
-  
-  # -------------------------------------------------------
-  # 6c-ii. METHOD-DISCORDANT KMER MOTIF ENRICHMENT
-  # Identifies sequence features that explain why certain
-  # kmers are detected by some pipeline methods but not others.
-  # Foreground = method-discordant kmers (detected by some but not all)
-  # Background = consensus kmers (detected by all methods)
-  # -------------------------------------------------------
-  
-  method_sets <- kmers_by_method[[deg_name]]
-  method_sets <- method_sets[sapply(method_sets, length) > 0]
-  
-  if (length(method_sets) >= 2) {
-    
-    kmers_all_methods <- Reduce(intersect, method_sets)
-    kmers_any_method  <- Reduce(union,     method_sets)
-    kmers_discordant  <- setdiff(kmers_any_method, kmers_all_methods)
-    
-    cat(sprintf("  Method-discordant kmers: %d consensus | %d discordant | %d total\n",
-                length(kmers_all_methods),
-                length(kmers_discordant),
-                length(kmers_any_method)))
-    
-    # --- Overall discordant vs consensus enrichment ---
-    if (length(kmers_discordant) >= 10 && length(kmers_all_methods) >= 10) {
-      
-      discordant_dt <- kmer_dt[kmer %in% kmers_discordant]
-      consensus_dt  <- kmer_dt[kmer %in% kmers_all_methods]
-      
-      motif_discordant <- motif_enrichment(discordant_dt, consensus_dt)
-      motif_discordant[, context := "method_discordant_vs_consensus"]
-      motif_discordant[, deg_set := deg_name]
-      
-      fwrite(motif_discordant,
-             file.path(deg_out,
-                       paste0("motif_method_discordant_vs_consensus_", today, ".csv")))
-      
-      # Sub-kmer enrichment for discordant vs consensus
-      with_progress({
-        p <- progressor(steps = length(subkmer_sizes) * 2)
-        
-        disc_subkmer_list <- future_lapply(subkmer_sizes, function(k_size) {
-          p(message = sprintf("Discordant sub-kmer k=%d", k_size))
-          sub_disc <- subkmer_enrichment(discordant_dt, consensus_dt, k=k_size)
-          sub_cons <- subkmer_enrichment(consensus_dt,  discordant_dt, k=k_size)
-          if (nrow(sub_disc) > 0) sub_disc[, direction := "discordant"]
-          if (nrow(sub_cons) > 0) sub_cons[, direction := "consensus_enriched"]
-          p(message = sprintf("Consensus sub-kmer k=%d", k_size))
-          rbindlist(list(sub_disc, sub_cons), fill=TRUE)
-        }, future.seed=TRUE)
-      })
-      
-      names(disc_subkmer_list) <- as.character(subkmer_sizes)
-      disc_subkmer_results <- rbindlist(disc_subkmer_list, fill=TRUE)
-      disc_subkmer_results[, deg_set := deg_name]
-      
-      fwrite(disc_subkmer_results,
-             file.path(deg_out,
-                       paste0("subkmer_method_discordant_vs_consensus_", today, ".csv")))
-      
-      # Seqlogos for discordant motifs
-      top_disc_motifs <- disc_subkmer_results[padj < 0.05][
-        order(pval), .SD[1:min(.N, 20)], by=.(k, direction)]
-      for (k_size in subkmer_sizes) {
-        if (nrow(top_disc_motifs[k == k_size]) > 0) {
-          plot_seqlogo_robust(top_disc_motifs, k_size, deg_out, today,
-                              paste0(deg_name, "_discordant"))
-        }
-      }
-      
-      cat(sprintf("  Discordant motif enrichment: %d significant kmers\n",
-                  sum(motif_discordant$padj < 0.05, na.rm=TRUE)))
-      
-    } else {
-      cat(sprintf("  [SKIP] Too few kmers for discordant enrichment",
-                  "(discordant=%d, consensus=%d)\n",
-                  length(kmers_discordant), length(kmers_all_methods)))
-    }
-    
-    # --- Per-method specific kmer motifs ---
-    # Foreground = kmers unique to this method
-    # Background = kmers found in all other methods combined
-    cat("  Per-method specific motif enrichment...\n")
-    
-    method_specific_motifs <- rbindlist(future_lapply(
-      names(method_sets), function(meth) {
-        
-        other_kmers  <- Reduce(union, method_sets[names(method_sets) != meth])
-        unique_kmers <- setdiff(method_sets[[meth]], other_kmers)
-        
-        if (length(unique_kmers) < 10 || length(other_kmers) < 10) return(NULL)
-        
-        fg <- kmer_dt[kmer %in% unique_kmers]
-        bg <- kmer_dt[kmer %in% other_kmers]
-        
-        res <- motif_enrichment(fg, bg)
-        if (nrow(res) == 0) return(NULL)
-        
-        res[, method  := meth]
-        res[, deg_set := deg_name]
-        res[, n_unique_kmers := length(unique_kmers)]
-        res
-      }, future.seed=TRUE), fill=TRUE)
-    
-    if (!is.null(method_specific_motifs) && nrow(method_specific_motifs) > 0) {
-      fwrite(method_specific_motifs,
-             file.path(deg_out,
-                       paste0("motif_method_specific_", today, ".csv")))
-      
-      # Summary: which methods have the most unique sequence-specific kmers
-      method_sig_summary <- method_specific_motifs[padj < 0.05, .(
-        n_sig_motifs     = .N,
-        top_motif        = kmer[which.min(pval)],
-        mean_enrichment  = mean(fold_enrichment, na.rm=TRUE),
-        n_unique_kmers   = first(n_unique_kmers)
-      ), by=method]
-      setorder(method_sig_summary, -n_sig_motifs)
-      
-      fwrite(method_sig_summary,
-             file.path(deg_out,
-                       paste0("motif_method_specific_summary_", today, ".csv")))
-      
-      cat("  Per-method specific motif summary:\n")
-      print(method_sig_summary)
-      
-    } else {
-      cat("  [SKIP] No significant method-specific motifs found\n")
-    }
-    
-    # --- Per-grouping-dimension discordance ---
-    # Break down discordance by aligner, trimmer, counter separately
-    # to identify which pipeline axis drives sequence-specific detection bias
-    for (dim_col in c("aligner", "fastq_trimmer", "counter")) {
-      if (!dim_col %in% names(kmer_dt)) next
-      dim_vals <- unique(kmer_dt[[dim_col]])
-      dim_vals <- dim_vals[!is.na(dim_vals)]
-      if (length(dim_vals) < 2) next
-      
-      dim_sets <- lapply(dim_vals, function(v) {
-        unique(kmer_dt[get(dim_col) == v & padj < 0.05, kmer])
-      })
-      names(dim_sets) <- dim_vals
-      dim_sets <- dim_sets[sapply(dim_sets, length) > 0]
-      if (length(dim_sets) < 2) next
-      
-      dim_consensus   <- Reduce(intersect, dim_sets)
-      dim_discordant  <- setdiff(Reduce(union, dim_sets), dim_consensus)
-      
-      if (length(dim_discordant) < 10 || length(dim_consensus) < 10) next
-      
-      dim_fg <- kmer_dt[kmer %in% dim_discordant]
-      dim_bg <- kmer_dt[kmer %in% dim_consensus]
-      
-      dim_motifs <- motif_enrichment(dim_fg, dim_bg)
-      if (nrow(dim_motifs) == 0) next
-      
-      dim_motifs[, dimension := dim_col]
-      dim_motifs[, deg_set   := deg_name]
-      
-      fwrite(dim_motifs,
-             file.path(deg_out,
-                       paste0("motif_discordant_by_", dim_col, "_", today, ".csv")))
-      
-      cat(sprintf("  %s-discordant motifs: %d sig | %d discordant kmers\n",
-                  dim_col,
-                  sum(dim_motifs$padj < 0.05, na.rm=TRUE),
-                  length(dim_discordant)))
-    }
-    
-  } else {
-    cat("  [SKIP] Fewer than 2 non-empty method sets — skipping discordant enrichment\n")
-  }
 
   # -------------------------------------------------------
   # 6d. WITHIN-DEG-SET REPRODUCIBILITY (across methods)
@@ -1351,9 +1034,9 @@ for (deg_file in deg_files) {
   # -------------------------------------------------------
   if ("gc_content" %in% names(kmers_dt) &&
       sum(!is.na(kmers_dt$gc_content)) > 0) {
-    p_gc <- ggplot(kmers_dt, aes(gc_content, fill=fixed_value)) +
+    p_gc <- ggplot(kmers_dt, aes(gc_content, fill=fastq_trimmer)) +
       geom_density(alpha=0.4) +
-      facet_wrap(~ fixed_value) +
+      facet_wrap(~ deg_list_trimmer) +
       theme_classic() +
       labs(title=paste0("GC-content by FASTQ trimmer\n", deg_name))
     ggsave(file.path(deg_out, paste0("gc_density_", today, ".pdf")), p_gc)
@@ -1383,28 +1066,6 @@ for (deg_file in deg_files) {
 cat("\nCombining all DEG sets...\n")
 analysis_dt <- rbindlist(full_dataset, fill=TRUE)
 
-# Guard: reconstruct fixed_value if missing from cached/incomplete DEG sets
-if (!"fixed_value" %in% names(analysis_dt)) {
-  cat("[WARNING] fixed_value missing from analysis_dt — reconstructing\n")
-  analysis_dt[, fixed_value := fcase(
-    !is.na(deg_list_trimmer) & deg_list_trimmer != "", deg_list_trimmer,
-    !is.na(deg_list_aligner) & deg_list_aligner != "", deg_list_aligner,
-    !is.na(deg_list_counter) & deg_list_counter != "", deg_list_counter,
-    default = "unknown"
-  )]
-} else if (any(is.na(analysis_dt$fixed_value))) {
-  cat("[WARNING] fixed_value has NAs — filling from deg_list columns\n")
-  analysis_dt[is.na(fixed_value), fixed_value := fcase(
-    !is.na(deg_list_trimmer) & deg_list_trimmer != "", deg_list_trimmer,
-    !is.na(deg_list_aligner) & deg_list_aligner != "", deg_list_aligner,
-    !is.na(deg_list_counter) & deg_list_counter != "", deg_list_counter,
-    default = "unknown"
-  )]
-}
-
-cat("fixed_value distribution:\n")
-print(analysis_dt[, .N, by=fixed_value])
-
 # ============================================================
 # CROSS-DEG ANALYSES
 # Uses all_deg_dt — raw DEG gene lists BEFORE kmer merging.
@@ -1414,14 +1075,6 @@ print(analysis_dt[, .N, by=fixed_value])
 # ============================================================
 
 all_deg_dt_combined <- rbindlist(all_deg_dt, fill=TRUE)
-
-if (!"fixed_value" %in% names(all_deg_dt_combined)) {
-  all_deg_dt_combined[, fixed_value := fcase(
-    !is.na(deg_list_trimmer) & deg_list_trimmer != "", deg_list_trimmer,
-    !is.na(deg_list_aligner) & deg_list_aligner != "", deg_list_aligner,
-    default = "unknown"
-  )]
-}
 
 fwrite(all_deg_dt_combined,
        file.path(output_dir, "tables",
@@ -1465,7 +1118,7 @@ fwrite(gene_cross_deg_counter,
 gene_cross_deg_trimmer <- all_deg_dt_combined[, .(
   n_deg_sets         = uniqueN(deg_name),
   cross_deg_fraction = uniqueN(deg_name) / length(deg_files)
-), by=.(ensembl_id, fixed_value)]
+), by=.(ensembl_id, deg_list_trimmer)]
 
 fwrite(gene_cross_deg_trimmer,
        file.path(output_dir, "tables",
@@ -1531,80 +1184,50 @@ if (length(subkmer_results_all) > 0) {
                    paste0("top_subkmer_motifs_global_", today, ".csv")))
 }
 
-# Combine method-discordant motif results across all DEG sets
-disc_motif_files <- list.files(output_dir, pattern="motif_method_discordant_vs_consensus_",
-                               recursive=TRUE, full.names=TRUE)
-if (length(disc_motif_files) > 0) {
-  disc_motifs_all <- rbindlist(lapply(disc_motif_files, fread), fill=TRUE)
-  fwrite(disc_motifs_all,
-         file.path(output_dir, "tables",
-                   paste0("motif_method_discordant_all_degsets_", today, ".csv")))
-  
-  # Global summary: most consistently discordant motifs across DEG sets
-  disc_motifs_global <- disc_motifs_all[padj < 0.05, .(
-    n_deg_sets       = uniqueN(deg_set),
-    mean_enrichment  = mean(fold_enrichment, na.rm=TRUE),
-    min_padj         = min(padj, na.rm=TRUE),
-    contexts         = paste(unique(context), collapse="|")
-  ), by=kmer]
-  setorder(disc_motifs_global, -n_deg_sets, min_padj)
-  fwrite(disc_motifs_global,
-         file.path(output_dir, "tables",
-                   paste0("motif_discordant_global_summary_", today, ".csv")))
-  cat("\nTop globally discordant motifs:\n")
-  print(head(disc_motifs_global, 10))
-}
-
-# Combine per-dimension discordant motifs
-for (dim_col in c("aligner", "fastq_trimmer", "counter")) {
-  dim_files <- list.files(output_dir,
-                          pattern=paste0("motif_discordant_by_", dim_col, "_"),
-                          recursive=TRUE, full.names=TRUE)
-  if (length(dim_files) == 0) next
-  
-  dim_motifs_all <- rbindlist(lapply(dim_files, fread), fill=TRUE)
-  fwrite(dim_motifs_all,
-         file.path(output_dir, "tables",
-                   paste0("motif_discordant_by_", dim_col, "_all_degsets_", today, ".csv")))
-  
-  cat(sprintf("\n%s-discordant motifs across all DEG sets: %d significant\n",
-              dim_col, sum(dim_motifs_all$padj < 0.05, na.rm=TRUE)))
-}
-
 # ============================================================
 # 8. GLOBAL FASTQ-TRIMMER SENSITIVITY SUMMARY
 # ============================================================
 
-fastq_sensitivity_dt <- rbindlist(fastq_sensitivity_all, fill=TRUE, idcol="deg_set")
+fastq_sensitivity_dt <- rbindlist(fastq_sensitivity_all, fill=TRUE)
 
-global_fastq_sens <- fastq_sensitivity_dt[, .(
-  mean_genes_norm = mean(genes_norm, na.rm=TRUE),
-  mean_kmers_norm = mean(kmers_norm, na.rm=TRUE),
-  sd_genes_norm   = sd(genes_norm,   na.rm=TRUE),
-  n_deg_sets      = uniqueN(deg_set)
-), by=.(grouping_type, fixed_value, varying_value)]
-
-fwrite(global_fastq_sens,
-       file.path(output_dir, "tables",
-                 paste0("global_fastq_sensitivity_summary_", today, ".csv")))
+# Summarise separately per grouping type since the varying dimension differs
+for (gtype in c("aligner", "trimmer", "counter")) {
+  sub <- fastq_sensitivity_dt[grouping_type == gtype]
+  if (nrow(sub) == 0) next
+  
+  vary_col  <- gtype
+  fixed_col <- switch(gtype,
+                      "aligner" = "deg_list_trimmer",
+                      "trimmer" = "deg_list_aligner",
+                      "counter" = "fixed_value")
+  
+  if (!fixed_col %in% names(sub)) next
+  
+  global_sens <- sub[, .(
+    mean_genes_norm = mean(genes_norm, na.rm=TRUE),
+    mean_kmers_norm = mean(kmers_norm, na.rm=TRUE),
+    sd_genes_norm   = sd(genes_norm,   na.rm=TRUE)
+  ), by=c(fixed_col, vary_col)]
+  
+  fwrite(global_sens,
+         file.path(output_dir, "tables",
+                   paste0("global_", gtype, "_sensitivity_summary_", today, ".csv")))
+}
 
 p_global_sens <- ggplot(global_fastq_sens,
-                        aes(x=varying_value, y=mean_genes_norm,
+                        aes(x=fastq_trimmer, y=mean_genes_norm,
                             ymin=mean_genes_norm - sd_genes_norm,
                             ymax=mean_genes_norm + sd_genes_norm,
-                            colour=varying_value)) +
+                            colour=fastq_trimmer)) +
   geom_pointrange() +
-  facet_grid(grouping_type ~ fixed_value, scales="free_x") +
+  facet_wrap(~ deg_list_trimmer) +
   theme_classic() +
-  theme(axis.text.x=element_text(angle=45, hjust=1),
-        strip.text.y=element_text(angle=0)) +
-  labs(title="Global sensitivity by varying dimension and fixed context",
-       y="Mean normalised gene recovery",
-       x="Varying dimension value",
-       colour="Varying value")
+  theme(axis.text.x=element_text(angle=45, hjust=1)) +
+  labs(title="Global FASTQ-trimmer sensitivity by DEG-list trimmer",
+       y="Mean normalised gene recovery", x="FASTQ trimmer")
 ggsave(file.path(output_dir, "figures",
                  paste0("global_fastq_sensitivity_", today, ".pdf")),
-       p_global_sens, width=14, height=8)
+       p_global_sens, width=12, height=6)
 
 # ============================================================
 # 9. GENE ROBUSTNESS STABILITY CURVES
@@ -1644,7 +1267,7 @@ consensus <- all_summaries_dt[, .(
   total_genes = sum(unique_genes),
   avg_gc      = mean(mean_gc,       na.rm=TRUE),
   avg_expr    = mean(mean_baseMean, na.rm=TRUE)
-), by=.(method, counter, fixed_value)]
+), by=.(method, counter, deg_list_trimmer)]
 
 consensus[, robustness_score :=
             as.numeric(scale(total_genes)) -
@@ -1688,22 +1311,19 @@ cat("Full gene x pipeline matrix:", nrow(full_dt), "rows |",
 # ============================================================
 
 kmer_global_stability <- analysis_dt[, .(
-  n_deg_sets     = uniqueN(method),
-  n_fastq_trimmers = uniqueN(fastq_trimmer[!is.na(fastq_trimmer)]),
-  n_counters     = uniqueN(counter[!is.na(counter)]),
-  n_aligners     = uniqueN(aligner[!is.na(aligner)]),
-  n_fixed_values = uniqueN(fixed_value[!is.na(fixed_value)]),
-  mean_baseMean  = mean(baseMean, na.rm=TRUE)
+  n_deg_sets          = uniqueN(method),
+  n_fastq_trimmers    = uniqueN(fastq_trimmer),
+  n_counters          = uniqueN(counter),
+  n_aligners          = uniqueN(aligner),
+  n_deg_list_trimmers = uniqueN(deg_list_trimmer),
+  mean_baseMean       = mean(baseMean, na.rm=TRUE)
 ), by=.(kmer, ensembl_id)]
 
-# Stability score: product of how broadly each kmer is detected
-# across each pipeline dimension — NAs excluded so missing dimensions
-# don't penalise kmers from DEG sets where that dimension doesn't vary
 kmer_global_stability[, kmer_stability_score :=
-                        (n_fastq_trimmers / length(trimmers)) *
-                        (n_counters       / length(counters)) *
-                        (n_aligners       / length(aligners)) *
-                        (n_deg_sets       / length(deg_files))]
+  (n_fastq_trimmers / length(trimmers)) *
+  (n_counters       / length(counters)) *
+  (n_aligners       / length(aligners)) *
+  (n_deg_sets       / length(deg_files))]
 
 setorder(kmer_global_stability, -kmer_stability_score)
 fwrite(kmer_global_stability,
