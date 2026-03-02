@@ -12,6 +12,8 @@ if (!"cmdstanr" %in% rownames(installed.packages())) {
   stop("cmdstanr required — install with: install.packages('cmdstanr', repos='https://mc-stan.org/r-packages/')")
 }
 
+# install.packages("DESeq2") if needed
+
 suppressPackageStartupMessages({
   library(openxlsx)
   library(data.table)
@@ -47,6 +49,7 @@ suppressPackageStartupMessages({
   library(ggraph)          # ggraph, geom_edge_link, geom_node_point
   library(RColorBrewer)    # brewer.pal
   library(piano)           # runGSA, loadGSC, GSAsummaryTable
+  library(DESeq2)
 })
 
 # Prevent dplyr from masking data.table functions
@@ -73,6 +76,7 @@ Gage2019_counts_2019genome_noAD <- read.csv('/home/thilsabeck/Documents/Gage2019
 Gage2024_metadata <- read.xlsx('/home/thilsabeck/Documents/Gage2024/RNAseq metadata_updatedAge_11-21-2024_reduced.xlsx', sheet = 1)
 Gage_merged_metadata <- read.xlsx('/home/thilsabeck/Documents/Gage2019/mapping/Gage_merged_MetaData_updated_10-23-2024_AgeMatched_FastqCheck_10-6-2025_02-28-2026update.xlsx')
 rownames(Gage2024_metadata) <- Gage2024_metadata$Sample.label
+rownames(Gage_merged_metadata) <- Gage_merged_metadata$Sample.label
 # Remove rows with NA in Sample.label of Gage_merged_metadata
 Gage_merged_metadata <- Gage_merged_metadata[!is.na(Gage_merged_metadata$Sample.label), ]
 Gage2024_counts_b1 <- read.csv('/home/thilsabeck/Documents/Gage2024/Gage2024_paired_raw_counts_batch1.csv')
@@ -106,6 +110,9 @@ stable_genes[, z_score := (cross_deg_fraction - mean(cross_deg_fraction, na.rm=T
 stable_genes[, is_stable := abs(z_score) > 2]
 cat("Loaded stable_genes with", nrow(stable_genes), "genes, of which",
     sum(stable_genes$is_stable, na.rm=TRUE), "are classified as stable (z < -2)\n")
+
+# Save stable_genes with hgnc_symbol and z_score to a new CSV for reference
+write.csv(stable_genes, file.path(output_dir, paste0("gene_cross_deg_reproducibility_2026-02-26_stable_genes_with_hgnc_and_zscore_", today, ".csv")), row.names = FALSE)
 
 # Compare stable genes across different Diag groups using Gage2024_metadata Diag column and Sample.label
 # Calculate mean values by gene in stable genes for genes with is_stable == TRUE by each Diag group
@@ -154,9 +161,6 @@ common_genes <- intersect(rownames(Gage2024_counts), ranked_genes)
 ranked_common_genes <- ranked_genes[ranked_genes %in% common_genes]
 
 Gage2024_counts_sub <- Gage2024_counts[ranked_common_genes, , drop = FALSE]
-
-# install.packages("DESeq2") if needed
-library(DESeq2)
 
 # Sample metadata with diagnosis labels
 # meta_new: data.frame with rownames = sample IDs, column Diag ∈ c("AD","CTRL")
@@ -266,8 +270,37 @@ normalize_counts <- function(counts_df, metadata, ranked_genes, stable_genes,
     design    = formula
   )
   dds <- dds[rowSums(counts(dds)) > 1, ]
-  vsd <- varianceStabilizingTransformation(dds, blind = TRUE)
-  expr <- t(assay(vsd))  # samples x genes
+  
+  # Check if data looks pre-normalized (non-integer or negative values)
+  raw_counts     <- counts(dds)
+  is_prenormalized <- any(raw_counts < 0) ||
+    mean(raw_counts == round(raw_counts)) < 0.95
+  
+  if (is_prenormalized) {
+    # Pre-normalized data: use directly or log2 transform
+    raw_range <- range(as.matrix(counts_sub), na.rm = TRUE)
+    if (raw_range[1] < 0 || raw_range[2] < 100) {
+      message(dataset_name, ": Data appears already log-scaled, using directly.")
+      expr <- t(as.matrix(counts_sub))
+    } else {
+      message(dataset_name, ": Data appears pre-normalized, applying log2(x+1).")
+      expr <- t(log2(as.matrix(counts_sub) + 1))
+    }
+  } else {
+    # Raw counts: try VST, fall back to normTransform
+    normalized <- tryCatch({
+      message(dataset_name, ": Applying VST normalization.")
+      varianceStabilizingTransformation(dds, blind = TRUE)
+    }, error = function(e) {
+      message(dataset_name, ": VST failed, falling back to normTransform.")
+      dds <- estimateSizeFactors(dds)
+      dds <- estimateDispersionsGeneEst(dds)
+      dispersions(dds) <- mcols(dds)$dispGeneEst
+      normTransform(dds)
+    })
+    
+    expr <- t(assay(normalized))  # samples x genes
+  }
   
   # ── 5. Preserve ranking ──────────────────────────────────────────────────
   ranked_common <- ranked_common[ranked_common %in% colnames(expr)]
@@ -743,64 +776,106 @@ run_loocv_elastic_net <- function(X, y, meta_use, alpha_val = 0.5) {
   pred_all
 }
 
-# LOOCV per-gene AUCs
 run_loocv_per_gene <- function(X, y, metadata, outdir, group_label, today) {
   gene_names <- colnames(X)
-  n <- length(y)
-  auc_vec <- numeric(length(gene_names))
+  n          <- length(y)
+  auc_vec    <- numeric(length(gene_names))
   names(auc_vec) <- gene_names
   
   for (g in gene_names) {
     pred_all <- numeric(n)
     
-    for (i in 1:n) {
-      test_idx  <- i
-      train_idx <- setdiff(1:n, i)
-      
-      X_train <- X[train_idx, g, drop = FALSE]
-      X_test  <- X[test_idx,  g, drop = FALSE]
-      y_train <- y[train_idx]
-      
-      df_train <- data.frame(y = y_train, x = X_train[, 1])
-      fit      <- glm(y ~ x, data = df_train, family = binomial())
-      df_test  <- data.frame(x = X_test[, 1])
-      p_hat    <- predict(fit, newdata = df_test, type = "response")
-      pred_all[test_idx] <- p_hat
+    # Skip genes with no variance
+    if (var(X[, g]) == 0) {
+      auc_vec[g] <- NA
+      next
     }
     
-    roc_g      <- roc(response = y, predictor = pred_all, quiet = TRUE)
+    for (i in 1:n) {
+      train_idx <- setdiff(1:n, i)
+      
+      df_train <- data.frame(
+        y   = y[train_idx],
+        x   = X[train_idx, g],
+        sex = as.factor(metadata$Sex[train_idx]),
+        age = as.numeric(metadata$Age[train_idx])
+      )
+      df_test <- data.frame(
+        x   = X[i, g],
+        sex = as.factor(metadata$Sex[i]),
+        age = as.numeric(metadata$Age[i])
+      )
+      
+      # Drop sex from model if only one level in training fold
+      has_sex_variance <- length(unique(df_train$sex)) > 1
+      formula_i <- if (has_sex_variance) y ~ x + sex + age else y ~ x + age
+      
+      fit <- tryCatch(
+        glm(formula_i, data = df_train, family = binomial()),
+        error   = function(e) NULL,
+        warning = function(w) suppressWarnings(
+          glm(formula_i, data = df_train, family = binomial())
+        )
+      )
+      
+      if (is.null(fit)) { pred_all[i] <- 0.5; next }
+      
+      pred_all[i] <- tryCatch(
+        predict(fit, newdata = df_test, type = "response"),
+        error = function(e) 0.5
+      )
+    }
+    
+    roc_g <- tryCatch(
+      roc(response = y, predictor = pred_all, quiet = TRUE),
+      error = function(e) NULL
+    )
+    
+    if (is.null(roc_g)) { auc_vec[g] <- NA; next }
+    
     auc_vec[g] <- as.numeric(auc(roc_g))
     
-    # Box plot
-    gene_expr <- as.numeric(X[, g])
+    # Box plot with sex as point shape and age as point color
     plot_df <- data.frame(
-      expression = gene_expr,
+      expression = as.numeric(X[, g]),
       group      = as.factor(metadata[["Diag"]]),
+      sex        = as.factor(metadata$Sex),
+      age        = as.numeric(metadata$Age),
       sample     = rownames(metadata)
     )
     
     p_box <- ggplot(plot_df, aes(x = group, y = expression, fill = group)) +
       geom_boxplot(outlier.shape = NA, alpha = 0.6) +
-      geom_jitter(width = 0.15, size = 2, alpha = 0.8) +
+      geom_jitter(
+        aes(shape = sex, color = age),
+        width = 0.2, size = 2.5, alpha = 0.9
+      ) +
+      scale_shape_manual(values = c("M" = 16, "F" = 17),
+                         na.value = 15) +
+      scale_color_gradient(low = "lightblue", high = "darkred",
+                           name = "Age") +
       labs(
-        title = paste0(g, " expression by Diagnosis"),
+        title = paste0(g, " | AUC: ", round(auc_vec[g], 3),
+                       " (adj. age + sex)"),
         x     = "Diagnosis",
         y     = "Expression",
-        fill  = "Diagnosis"
+        fill  = "Diagnosis",
+        shape = "Sex"
       ) +
       theme_bw() +
       theme(
-        plot.title      = element_text(face = "bold", size = 14),
+        plot.title      = element_text(face = "bold", size = 12),
         axis.text.x     = element_text(angle = 45, hjust = 1),
-        legend.position = "none"
+        legend.position = "right"
       )
     
     ggsave(
-      filename = file.path(outdir, paste0(group_label, "_", g, "_expression_by_Diag_", today, ".pdf")),
-      plot     = p_box,
-      width    = 6,
-      height   = 5,
-      device   = cairo_pdf
+      filename = file.path(outdir, paste0(group_label, "_", g,
+                                          "_expression_by_Diag_", today, ".pdf")),
+      plot   = p_box,
+      width  = 7,
+      height = 5,
+      device = cairo_pdf
     )
   }
   
@@ -842,11 +917,11 @@ bootstrap_auc_ci <- function(y, p_hat, B = 1000, conf = 0.95) {
 }
 
 # Settings
-output_dir <- "/home/thilsabeck/Documents/Gage2024/RNApreprocessing_gene_validation_files/"
+output_dir <- "/home/thilsabeck/Documents/Gage2024/RNApreprocessing_gene_validation_files/AgeSex_confounds/"
 if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
 
 alpha_val <- 0.5
-B_boot    <- 2000
+B_boot    <- 1000
 today     <- format(Sys.Date(), "%m-%d-%Y")
 
 results_summary <- list()
@@ -1374,3 +1449,475 @@ write.csv(
   file      = file.path(output_dir, paste0("multidataset_auc_summary_", today, ".csv")),
   row.names = FALSE
 )
+
+### Modified version of above to also run the analysis after removing sex-related genes and to save the single gene plots in a single pdf 03-02-2026
+output_dir <- "/home/thilsabeck/Documents/Gage2024/RNApreprocessing_gene_validation_files/AgeSex_confounds/"
+if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+
+alpha_val <- 0.5
+B_boot    <- 1000
+today     <- format(Sys.Date(), "%m-%d-%Y")
+
+# Sex chromosome gene patterns to remove
+sex_chr_patterns <- "XIST|DDX3Y|USP9Y|RPS4Y1|ZFY|TSIX|EIF1AY|KDM5D|NLGN4Y|TMSB4Y|UTY|PRKY|PCDH11Y"
+
+results_summary <- list()
+
+# Helper to run the full per-gene + elastic net analysis for one X matrix
+run_analysis <- function(X, y, meta_use, dname, label, ensembl_ids, hgnc_symbols,
+                         output_dir, today, alpha_val, B_boot) {
+  
+  gene_names   <- colnames(X)
+  gene_symbols <- hgnc_symbols[match(gene_names, ensembl_ids)]
+  n            <- length(y)
+  auc_vec      <- numeric(length(gene_names))
+  ci_low_vec   <- numeric(length(gene_names))
+  ci_high_vec  <- numeric(length(gene_names))
+  names(auc_vec) <- names(ci_low_vec) <- names(ci_high_vec) <- gene_names
+  
+  # Collect per-gene plots for combined PDF
+  boxplot_list <- list()
+  gene_n <- 0
+  
+  for (g in gene_names) {
+    gene_n <- gene_n + 1
+    pred_all <- numeric(n)
+    
+    if (var(X[, g]) == 0) {
+      auc_vec[g] <- NA; ci_low_vec[g] <- NA; ci_high_vec[g] <- NA
+      next
+    }
+    
+    for (i in 1:n) {
+      train_idx <- setdiff(1:n, i)
+      
+      df_train <- data.frame(
+        y   = y[train_idx],
+        x   = X[train_idx, g],
+        sex = as.factor(meta_use$Sex[train_idx]),
+        age = as.numeric(meta_use$Age[train_idx])
+      )
+      df_test <- data.frame(
+        x   = X[i, g],
+        sex = as.factor(meta_use$Sex[i]),
+        age = as.numeric(meta_use$Age[i])
+      )
+      
+      has_sex_variance <- length(unique(df_train$sex)) > 1
+      formula_i <- if (has_sex_variance) y ~ x + sex + age else y ~ x + age
+      
+      fit <- tryCatch(
+        glm(formula_i, data = df_train, family = binomial()),
+        error   = function(e) NULL,
+        warning = function(w) suppressWarnings(
+          glm(formula_i, data = df_train, family = binomial())
+        )
+      )
+      
+      if (is.null(fit)) { pred_all[i] <- 0.5; next }
+      pred_all[i] <- tryCatch(
+        predict(fit, newdata = df_test, type = "response"),
+        error = function(e) 0.5
+      )
+    }
+    
+    roc_g <- tryCatch(
+      roc(response = y, predictor = pred_all, quiet = TRUE),
+      error = function(e) NULL
+    )
+    
+    if (is.null(roc_g)) {
+      auc_vec[g] <- NA; ci_low_vec[g] <- NA; ci_high_vec[g] <- NA; next
+    }
+    
+    auc_vec[g]    <- as.numeric(auc(roc_g))
+    ci_g          <- bootstrap_auc_ci(y = y, p_hat = pred_all, B = B_boot, conf = 0.95)
+    ci_low_vec[g] <- ci_g$ci_low
+    ci_high_vec[g]<- ci_g$ci_high
+    
+    # Box plot
+    sym <- if (!is.na(gene_symbols[gene_n])) gene_symbols[gene_n] else g
+    plot_df <- data.frame(
+      expression = as.numeric(X[, g]),
+      group      = as.factor(meta_use[["Diag"]]),
+      sex        = as.factor(meta_use$Sex),
+      age        = as.numeric(meta_use$Age),
+      sample     = rownames(meta_use)
+    )
+    
+    p_box <- ggplot(plot_df, aes(x = group, y = expression, fill = group)) +
+      geom_boxplot(outlier.shape = NA, alpha = 0.6) +
+      geom_jitter(aes(shape = sex, color = age), width = 0.2, size = 2.5, alpha = 0.9) +
+      scale_shape_manual(values = c("M" = 16, "F" = 17), na.value = 15) +
+      scale_color_gradient(low = "lightblue", high = "darkred", name = "Age") +
+      labs(
+        title = paste0(sym, ":", g,
+                       " | AUC: ", round(auc_vec[g], 3),
+                       " [", round(ci_low_vec[g], 3),
+                       ", ", round(ci_high_vec[g], 3), "]",
+                       " (adj. age+sex)"),
+        x = "Diagnosis", y = "Expression",
+        fill = "Diagnosis", shape = "Sex"
+      ) +
+      theme_bw() +
+      theme(
+        plot.title      = element_text(face = "bold", size = 10),
+        axis.text.x     = element_text(angle = 45, hjust = 1),
+        legend.position = "right"
+      )
+    
+    boxplot_list[[g]] <- p_box
+  }
+  
+  # Save all gene boxplots in one combined PDF
+  combined_pdf_path <- file.path(output_dir,
+                                 paste0(label, "_all_gene_boxplots_", today, ".pdf"))
+  pdf(combined_pdf_path, width = 7, height = 5)
+  for (p in boxplot_list) print(p)
+  dev.off()
+  message(label, ": Saved ", length(boxplot_list), " gene plots to ", combined_pdf_path)
+  
+  # Build per_gene_df
+  per_gene_df <- data.frame(
+    ensembl_id  = ensembl_ids,
+    gene_symbol = hgnc_symbols,
+    auc         = as.numeric(auc_vec),
+    ci_low      = as.numeric(ci_low_vec),
+    ci_high     = as.numeric(ci_high_vec)
+  )
+  
+  per_gene_df_sorted <- per_gene_df[!is.na(per_gene_df$auc), ]
+  per_gene_df_sorted <- per_gene_df_sorted[order(-per_gene_df_sorted$auc), ]
+  
+  per_gene_df_sorted$strength <- cut(
+    per_gene_df_sorted$auc,
+    breaks = c(0, 0.6, 0.7, 0.8, 0.9, 1.0),
+    labels = c("Poor (<0.6)", "Fair (0.6-0.7)", "Good (0.7-0.8)",
+               "Strong (0.8-0.9)", "Excellent (>0.9)"),
+    include.lowest = TRUE
+  )
+  
+  top20 <- head(per_gene_df_sorted, 20)
+  
+  p_biomarker <- ggplot(top20, aes(x = auc, y = reorder(gene_symbol, auc), color = strength)) +
+    geom_point(size = 4) +
+    geom_errorbarh(aes(xmin = ci_low, xmax = ci_high), height = 0.3) +
+    geom_vline(xintercept = 0.5, linetype = "dashed",  color = "grey50") +
+    geom_vline(xintercept = 0.7, linetype = "dotted",  color = "orange") +
+    geom_vline(xintercept = 0.8, linetype = "dotted",  color = "red") +
+    scale_color_manual(values = c(
+      "Poor (<0.6)"      = "grey60",
+      "Fair (0.6-0.7)"   = "steelblue",
+      "Good (0.7-0.8)"   = "darkgreen",
+      "Strong (0.8-0.9)" = "orange",
+      "Excellent (>0.9)" = "red"
+    )) +
+    scale_x_continuous(limits = c(0.4, 1.0), breaks = seq(0.4, 1.0, 0.1)) +
+    labs(
+      title  = paste0("Top AD Biomarkers - ", label, "\n(LOOCV AUC adj. age + sex)"),
+      x      = "AUC (95% bootstrap CI)",
+      y      = "Gene",
+      color  = "Biomarker Strength"
+    ) +
+    theme_bw(base_size = 11) +
+    theme(plot.title = element_text(face = "bold", size = 12), legend.position = "bottom")
+  
+  ggsave(file.path(output_dir, paste0("top_biomarkers_", label, "_", today, ".pdf")),
+         p_biomarker, width = 8, height = 7, device = cairo_pdf)
+  
+  write.csv(head(per_gene_df_sorted, 20),
+            file.path(output_dir, paste0("top20_biomarkers_", label, "_", today, ".csv")),
+            row.names = FALSE)
+  write.csv(per_gene_df,
+            file.path(output_dir, paste0("per_gene_LOOCV_auc_", label, "_", today, ".csv")),
+            row.names = FALSE)
+  
+  # ── Elastic net ──────────────────────────────────────────────────────────
+  pred_multi <- run_loocv_elastic_net(X, y, meta_use = meta_use, alpha_val = alpha_val)
+  roc_multi  <- roc(response = y, predictor = pred_multi, quiet = TRUE)
+  auc_multi  <- as.numeric(auc(roc_multi))
+  boot_res   <- bootstrap_auc_ci(y, pred_multi, B = B_boot, conf = 0.95)
+  
+  boot_df <- data.frame(iteration = 1:B_boot, auc = boot_res$auc_boot)
+  write.csv(boot_df,
+            file.path(output_dir, paste0("multigene_bootstrap_auc_", label, "_", today, ".csv")),
+            row.names = FALSE)
+  
+  sex_numeric     <- ifelse(toupper(meta_use$Sex) == "M", 1, 0)
+  cov_mat         <- cbind(Age = as.numeric(meta_use$Age), Sex = sex_numeric)
+  X_full          <- cbind(X, cov_mat)
+  penalty_factors <- c(rep(1, ncol(X)), rep(0, ncol(cov_mat)))
+  
+  cvfit_enet <- cv.glmnet(
+    x = X_full, y = y, family = "binomial", alpha = alpha_val,
+    nfolds = min(5, length(y)), type.measure = "auc",
+    penalty.factor = penalty_factors
+  )
+  cvfit_lasso <- cv.glmnet(
+    x = X_full, y = y, family = "binomial", alpha = 1,
+    nfolds = min(5, length(y)), type.measure = "auc",
+    penalty.factor = penalty_factors
+  )
+  
+  cat("\n", label, "- Elastic net (alpha=", alpha_val, "):\n")
+  cat("  lambda.min:", sum(coef(cvfit_enet,  s = "lambda.min")[-1] != 0), "genes\n")
+  cat("  lambda.1se:", sum(coef(cvfit_enet,  s = "lambda.1se")[-1] != 0), "genes\n")
+  cat("Lasso:\n")
+  cat("  lambda.min:", sum(coef(cvfit_lasso, s = "lambda.min")[-1] != 0), "genes\n")
+  cat("  lambda.1se:", sum(coef(cvfit_lasso, s = "lambda.1se")[-1] != 0), "genes\n")
+  
+  pdf(file.path(output_dir, paste0("glmnet_CV_curves_", label, "_", today, ".pdf")),
+      width = 10, height = 5)
+  par(mfrow = c(1, 2))
+  plot(cvfit_enet,  main = paste("Elastic net -", label))
+  plot(cvfit_lasso, main = paste("Lasso -", label))
+  dev.off()
+  
+  best_fit  <- if (sum(coef(cvfit_enet, s = "lambda.min")[-1] != 0) > 0) cvfit_enet else cvfit_lasso
+  coef_full <- coef(best_fit, s = "lambda.min")
+  
+  coef_df <- data.frame(feature = rownames(coef_full)[-1], coef = as.numeric(coef_full)[-1])
+  coef_df <- coef_df[coef_df$coef != 0 & !coef_df$feature %in% c("Age", "Sex"), ]
+  coef_df$gene_symbol <- stable_genes$hgnc_symbol[match(coef_df$feature, stable_genes$ensembl_id)]
+  coef_df$gene_symbol[is.na(coef_df$gene_symbol)] <- coef_df$feature[is.na(coef_df$gene_symbol)]
+  coef_df <- coef_df[order(-abs(coef_df$coef)), ]
+  
+  cat("Final selected genes:", nrow(coef_df), "\n")
+  cat("Selected:", paste(coef_df$gene_symbol, collapse = ", "), "\n")
+  
+  write.csv(coef_df,
+            file.path(output_dir, paste0("elastic_net_coefficients_", label, "_", today, ".csv")),
+            row.names = FALSE)
+  
+  # Collinearity plots
+  top20_genes <- head(per_gene_df_sorted$ensembl_id[
+    per_gene_df_sorted$ensembl_id %in% colnames(X)], 20)
+  top20_sym <- stable_genes$hgnc_symbol[match(top20_genes, stable_genes$ensembl_id)]
+  top20_sym[is.na(top20_sym)] <- top20_genes[is.na(top20_sym)]
+  
+  if (length(top20_genes) > 1) {
+    X_top20 <- X[, top20_genes, drop = FALSE]
+    colnames(X_top20) <- top20_sym
+    cor_mat <- cor(X_top20, use = "pairwise.complete.obs")
+    
+    p_cor_heat <- ggplot(reshape2::melt(cor_mat), aes(x = Var1, y = Var2, fill = value)) +
+      geom_tile() +
+      geom_text(aes(label = round(value, 2)), size = 2.5) +
+      scale_fill_gradient2(low = "steelblue", mid = "white", high = "tomato",
+                           midpoint = 0, limits = c(-1, 1)) +
+      labs(title = paste0("Top gene collinearity - ", label),
+           x = NULL, y = NULL, fill = "Pearson r") +
+      theme_bw(base_size = 9) +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1))
+    
+    ggsave(file.path(output_dir, paste0("collinearity_heatmap_", label, "_", today, ".pdf")),
+           p_cor_heat,
+           width = max(6, length(top20_genes) * 0.5),
+           height = max(5, length(top20_genes) * 0.5),
+           device = cairo_pdf)
+    
+    pheatmap::pheatmap(
+      cor_mat,
+      color           = colorRampPalette(c("steelblue", "white", "tomato"))(100),
+      breaks          = seq(-1, 1, length.out = 101),
+      display_numbers = TRUE, number_format = "%.2f", fontsize_number = 7,
+      main            = paste0("Top gene correlation - ", label),
+      filename        = file.path(output_dir,
+                                  paste0("collinearity_clustered_", label, "_", today, ".pdf")),
+      width  = max(6, length(top20_genes) * 0.4),
+      height = max(5, length(top20_genes) * 0.4)
+    )
+    
+    if (nrow(coef_df) > 1) {
+      sel_genes <- coef_df$feature[coef_df$feature %in% colnames(X)]
+      sel_sym   <- coef_df$gene_symbol[coef_df$feature %in% colnames(X)]
+      X_sel     <- X[, sel_genes, drop = FALSE]
+      colnames(X_sel) <- sel_sym
+      cor_sel   <- cor(X_sel, use = "pairwise.complete.obs")
+      pheatmap::pheatmap(
+        cor_sel,
+        color           = colorRampPalette(c("steelblue", "white", "tomato"))(100),
+        breaks          = seq(-1, 1, length.out = 101),
+        display_numbers = TRUE, number_format = "%.2f", fontsize_number = 8,
+        main            = paste0("Selected gene correlation - ", label),
+        filename        = file.path(output_dir,
+                                    paste0("selected_gene_correlation_", label, "_", today, ".pdf")),
+        width  = max(4, nrow(coef_df) * 0.5),
+        height = max(4, nrow(coef_df) * 0.5)
+      )
+    }
+  }
+  
+  # Summary plots
+  p_gene_bar <- ggplot(per_gene_df_sorted, aes(x = reorder(gene_symbol, auc), y = auc)) +
+    geom_col(fill = "steelblue", alpha = 0.8) +
+    geom_errorbar(aes(ymin = ci_low, ymax = ci_high), width = 0.3, color = "black") +
+    geom_hline(yintercept = 0.7, linetype = "dotted", color = "orange") +
+    geom_hline(yintercept = 0.8, linetype = "dotted", color = "red") +
+    coord_flip() +
+    theme_bw(base_size = 10) +
+    labs(title = paste("Per-gene LOOCV AUC (adj. age+sex) -", label),
+         x = "Gene", y = "AUC (95% CI)")
+  
+  ggsave(file.path(output_dir, paste0("per_gene_LOOCV_auc_bar_", label, "_", today, ".png")),
+         p_gene_bar, width = 6, height = 8, dpi = 300)
+  
+  auc_strength <- cut(auc_multi, breaks = c(0, 0.6, 0.7, 0.8, 0.9, 1.0),
+                      labels = c("Poor", "Fair", "Good", "Strong", "Excellent"),
+                      include.lowest = TRUE)
+  
+  p_boot <- ggplot(boot_df, aes(x = auc)) +
+    geom_histogram(color = "black", fill = "steelblue", bins = 30) +
+    geom_vline(xintercept = auc_multi,        color = "red",     linewidth = 1.1) +
+    geom_vline(xintercept = boot_res$ci_low,  color = "red",     linetype = "dashed") +
+    geom_vline(xintercept = boot_res$ci_high, color = "red",     linetype = "dashed") +
+    geom_vline(xintercept = 0.7,              color = "orange",  linetype = "dotted") +
+    geom_vline(xintercept = 0.8,              color = "darkred", linetype = "dotted") +
+    annotate("text", x = auc_multi, y = Inf,
+             label = paste0("AUC=", round(auc_multi, 3), " (", auc_strength, ")"),
+             vjust = 2, hjust = -0.1, color = "red", size = 3.5) +
+    theme_bw(base_size = 10) +
+    labs(title = paste0("Multigene LOOCV AUC (adj. age+sex) - ", label,
+                        "\nMean: ", round(boot_res$mean, 3),
+                        " CI [", round(boot_res$ci_low, 3),
+                        ", ", round(boot_res$ci_high, 3), "]"),
+         x = "AUC", y = "Count")
+  
+  ggsave(file.path(output_dir, paste0("multigene_bootstrap_auc_hist_", label, "_", today, ".png")),
+         p_boot, width = 6, height = 4, dpi = 300)
+  
+  p_compare <- ggplot(per_gene_df_sorted, aes(x = auc)) +
+    geom_histogram(color = "black", fill = "grey70", bins = 15) +
+    geom_vline(xintercept = auc_multi,        color = "red",    linewidth = 1.1) +
+    geom_vline(xintercept = boot_res$ci_low,  color = "red",    linetype = "dashed") +
+    geom_vline(xintercept = boot_res$ci_high, color = "red",    linetype = "dashed") +
+    geom_vline(xintercept = 0.5,              color = "grey40", linetype = "dashed") +
+    annotate("text", x = auc_multi, y = Inf,
+             label = paste0("Multigene\nAUC=", round(auc_multi, 3)),
+             vjust = 2, hjust = -0.1, color = "red", size = 3) +
+    theme_bw(base_size = 10) +
+    labs(title = paste("Per-gene vs multigene AUC -", label),
+         x = "AUC", y = "Number of genes")
+  
+  ggsave(file.path(output_dir, paste0("per_gene_vs_multigene_auc_", label, "_", today, ".png")),
+         p_compare, width = 5, height = 4, dpi = 300)
+  
+  if (nrow(coef_df) > 0) {
+    coef_df$direction <- ifelse(coef_df$coef > 0, "Higher in AD", "Lower in AD")
+    p_coef <- ggplot(coef_df, aes(x = coef, y = reorder(gene_symbol, abs(coef)), fill = direction)) +
+      geom_col(alpha = 0.85) +
+      geom_vline(xintercept = 0, color = "black", linewidth = 0.5) +
+      scale_fill_manual(values = c("Higher in AD" = "tomato", "Lower in AD" = "steelblue")) +
+      labs(title = paste0("Elastic Net Selected Genes - ", label,
+                          "\n(LOOCV AUC: ", round(auc_multi, 3),
+                          " [", round(boot_res$ci_low, 3), ", ", round(boot_res$ci_high, 3), "]",
+                          " | adj. age+sex)"),
+           x = "Coefficient", y = "Gene", fill = "Direction") +
+      theme_bw(base_size = 11) +
+      theme(plot.title = element_text(face = "bold", size = 11), legend.position = "bottom")
+    
+    ggsave(file.path(output_dir, paste0("elastic_net_coef_", label, "_", today, ".pdf")),
+           p_coef, width = 7, height = max(4, nrow(coef_df) * 0.35), device = cairo_pdf)
+  }
+  
+  cat("Dataset", label, "done.\n")
+  cat("  Multigene LOOCV AUC:", round(auc_multi, 3), "\n")
+  cat("  Bootstrap mean:", round(boot_res$mean, 3),
+      "CI [", round(boot_res$ci_low, 3), ",", round(boot_res$ci_high, 3), "]\n")
+  cat("  Elastic net selected", nrow(coef_df), "genes\n")
+  
+  list(
+    per_gene_df       = per_gene_df,
+    auc_multi         = auc_multi,
+    boot_mean         = boot_res$mean,
+    boot_ci_low       = boot_res$ci_low,
+    boot_ci_high      = boot_res$ci_high,
+    elastic_net_genes = coef_df
+  )
+}
+
+# ── Main loop ────────────────────────────────────────────────────────────────
+for (dname in names(normalized_list)) {
+  cat("\n=== Dataset:", dname, "===\n")
+  
+  nd       <- normalized_list[[dname]]
+  X        <- nd$X
+  y        <- nd$y
+  meta_use <- nd$metadata
+  
+  # Map gene IDs
+  if (nd$gene_names[1] %in% stable_genes$ensembl_id) {
+    ensembl_ids  <- nd$gene_names
+    hgnc_symbols <- stable_genes$hgnc_symbol[match(nd$gene_names, stable_genes$ensembl_id)]
+  } else if (nd$gene_names[1] %in% stable_genes$hgnc_symbol) {
+    hgnc_symbols <- nd$gene_names
+    ensembl_ids  <- stable_genes$ensembl_id[match(nd$gene_names, stable_genes$hgnc_symbol)]
+  } else {
+    warning(dname, ": Gene names unmatched, keeping original")
+    hgnc_symbols <- nd$gene_names
+    ensembl_ids  <- rep(NA, length(nd$gene_names))
+  }
+  
+  stopifnot(nrow(X) == length(y))
+  stopifnot(all(rownames(X) == rownames(meta_use)))
+  
+  # ── Run 1: All genes ─────────────────────────────────────────────────────
+  cat("\n-- Run: all genes --\n")
+  results_summary[[paste0(dname, "_allgenes")]] <- run_analysis(
+    X           = X,
+    y           = y,
+    meta_use    = meta_use,
+    dname       = dname,
+    label       = paste0(dname, "_allgenes"),
+    ensembl_ids = ensembl_ids,
+    hgnc_symbols= hgnc_symbols,
+    output_dir  = output_dir,
+    today       = today,
+    alpha_val   = alpha_val,
+    B_boot      = B_boot
+  )
+  
+  # ── Run 2: Sex chromosome genes removed ──────────────────────────────────
+  sex_mask     <- grepl(sex_chr_patterns, colnames(X)) |
+    grepl(sex_chr_patterns, hgnc_symbols[match(colnames(X), ensembl_ids)])
+  X_nosex      <- X[, !sex_mask, drop = FALSE]
+  ens_nosex    <- ensembl_ids[!sex_mask]
+  hgnc_nosex   <- hgnc_symbols[!sex_mask]
+  
+  cat("\n-- Run: sex genes removed (", sum(sex_mask), "genes removed) --\n")
+  
+  if (ncol(X_nosex) == 0) {
+    warning(dname, ": No genes remaining after sex chromosome removal, skipping")
+  } else {
+    results_summary[[paste0(dname, "_nosexgenes")]] <- run_analysis(
+      X           = X_nosex,
+      y           = y,
+      meta_use    = meta_use,
+      dname       = dname,
+      label       = paste0(dname, "_nosexgenes"),
+      ensembl_ids = ens_nosex,
+      hgnc_symbols= hgnc_nosex,
+      output_dir  = output_dir,
+      today       = today,
+      alpha_val   = alpha_val,
+      B_boot      = B_boot
+    )
+  }
+}
+
+# ── Save overall summary ─────────────────────────────────────────────────────
+summary_df <- do.call(rbind, lapply(names(results_summary), function(lname) {
+  s <- results_summary[[lname]]
+  data.frame(
+    label     = lname,
+    auc_multi = s$auc_multi,
+    boot_mean = s$boot_mean,
+    ci_low    = s$boot_ci_low,
+    ci_high   = s$boot_ci_high,
+    n_elastic = nrow(s$elastic_net_genes)
+  )
+}))
+
+write.csv(summary_df,
+          file.path(output_dir, paste0("multidataset_auc_summary_", today, ".csv")),
+          row.names = FALSE)
