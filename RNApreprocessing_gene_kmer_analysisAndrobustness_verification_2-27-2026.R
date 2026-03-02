@@ -1094,7 +1094,7 @@ for (dname in names(normalized_list)) {
                             y = reorder(gene_symbol, auc),
                             color = strength)) +
     geom_point(size = 4) +
-    geom_errorbarh(aes(xmin = ci_low, xmax = ci_high), height = 0.3) +
+    geom_errorbarh(aes(xmin = ci_low, xmax = ci_high), height = 0.3, linewidth = 0.7) +
     geom_vline(xintercept = 0.5, linetype = "dashed", color = "grey50") +
     geom_vline(xintercept = 0.7, linetype = "dotted", color = "orange") +
     geom_vline(xintercept = 0.8, linetype = "dotted", color = "red") +
@@ -1739,8 +1739,14 @@ run_analysis <- function(X, y, meta_use, dname, label, ensembl_ids, hgnc_symbols
   combined_pdf_path <- file.path(output_dir,
                                  paste0(label, "_all_gene_plots_", today, ".pdf"))
   message("Saving combined gene plot PDF: ", combined_pdf_path)
+  # Order plots by decreasing balanced_acc_opt, then decreasing AUC
+  plot_order <- gene_summary_df$ensembl_id  # gene_summary_df already sorted by balanced_acc_opt
+  plot_order_valid <- plot_order[plot_order %in% names(boxplot_list)]
+  # Any genes in boxplot_list but not in gene_summary_df (e.g. NA AUC) go last
+  remainder <- setdiff(names(boxplot_list), plot_order_valid)
+  
   pdf(combined_pdf_path, width = 14, height = 10)
-  for (g in names(boxplot_list)) print(boxplot_list[[g]])
+  for (g in c(plot_order_valid, remainder)) print(boxplot_list[[g]])
   dev.off()
   message("Saved ", length(boxplot_list), " gene plots to ", combined_pdf_path)
   
@@ -1839,7 +1845,7 @@ run_analysis <- function(X, y, meta_use, dname, label, ensembl_ids, hgnc_symbols
   
   p_biomarker <- ggplot(top20, aes(y = reorder(gene_symbol, balanced_acc_opt))) +
     geom_point(aes(x = auc, color = "AUC"), size = 4) +
-    geom_errorbarh(aes(xmin = ci_low, xmax = ci_high, color = "AUC"), height = 0.25) +
+    geom_errorbarh(aes(xmin = ci_low, xmax = ci_high, color = "AUC"), height = 0.25, linewidth = 0.7) +
     geom_point(aes(x = balanced_acc_opt, color = "Balanced Accuracy (optimal thresh)"),
                size = 4, shape = 18) +
     geom_point(aes(x = balanced_acc_05,  color = "Balanced Accuracy (0.5 thresh)"),
@@ -2070,14 +2076,15 @@ run_analysis <- function(X, y, meta_use, dname, label, ensembl_ids, hgnc_symbols
   
   enet_row <- data.frame(
     gene_symbol      = paste0("Elastic net (", nrow(coef_df), " genes)"),
-    auc              = round(auc_multi,       3),
-    ci_low           = round(boot_res$ci_low, 3),
-    ci_high          = round(boot_res$ci_high,3),
-    balanced_acc_opt = round(enet_balacc_opt, 3),
-    balanced_acc_05  = round(enet_balacc_05,  3),
-    sensitivity_opt  = round(enet_sens_opt,   3),
-    specificity_opt  = round(enet_spec_opt,   3),
-    model_type       = "Elastic net (LOOCV)"
+    auc              = round(auc_multi,            3),
+    ci_low           = round(enet_boot_res$ci_low, 3),   # was boot_res$ci_low
+    ci_high          = round(enet_boot_res$ci_high,3),   # was boot_res$ci_high
+    balanced_acc_opt = round(enet_balacc_opt,      3),
+    balanced_acc_05  = round(enet_balacc_05,       3),
+    sensitivity_opt  = round(enet_sens_opt,        3),
+    specificity_opt  = round(enet_spec_opt,        3),
+    model_type       = "Elastic net (LOOCV)",
+    stringsAsFactors = FALSE
   )
   
   comparison_df <- rbind(top10_compare, enet_row)
@@ -2085,64 +2092,164 @@ run_analysis <- function(X, y, meta_use, dname, label, ensembl_ids, hgnc_symbols
             file.path(output_dir, paste0("comparison_singlegene_vs_enet_", label, "_", today, ".csv")),
             row.names = FALSE)
   
-  # Dot plot: AUC + balanced accuracy, single-gene vs elastic net
+  # Compute enet bootstrap CI for the comparison plot
+  enet_boot_res <- bootstrap_auc_ci(y = y, p_hat = pred_multi, B = B_boot, conf = 0.95)
+  
+  comparison_df$is_enet <- comparison_df$model_type == "Elastic net (LOOCV)"
+  
   p_compare <- ggplot(comparison_df,
-                      aes(y      = reorder(gene_symbol, balanced_acc_opt),
-                          color  = model_type,
-                          shape  = model_type)) +
-    # AUC with CI
-    geom_point(aes(x = auc), size = 4) +
-    geom_errorbarh(aes(xmin = ci_low, xmax = ci_high), height = 0.3) +
-    # Balanced accuracy at optimal threshold
-    geom_point(aes(x = balanced_acc_opt), size = 4, shape = 18, alpha = 0.8) +
-    # Balanced accuracy at 0.5
-    geom_point(aes(x = balanced_acc_05),  size = 3, shape = 15, alpha = 0.6) +
-    geom_vline(xintercept = 0.5, linetype = "dashed",  color = "grey50") +
-    geom_vline(xintercept = 0.7, linetype = "dotted",  color = "orange") +
-    geom_vline(xintercept = 0.8, linetype = "dotted",  color = "red") +
-    scale_color_manual(values = c(
-      "Single gene (LOOCV logistic)" = "steelblue",
-      "Elastic net (LOOCV)"          = "tomato"
-    )) +
+                      aes(y     = reorder(gene_symbol, balanced_acc_opt),
+                          color = model_type)) +
+    # AUC point + CI for all rows
+    geom_errorbarh(aes(xmin = ci_low, xmax = ci_high),
+                   height = 0.3, linewidth = 0.7) +
+    geom_point(aes(x = auc, shape = "AUC"), size = 4) +
+    # Balanced accuracy optimal threshold — filled diamond (shape 23)
+    geom_point(aes(x = balanced_acc_opt, shape = "BalAcc (optimal thresh)"),
+               size = 4, alpha = 0.85) +
+    # Balanced accuracy at 0.5 — filled square (shape 22)
+    geom_point(aes(x = balanced_acc_05, shape = "BalAcc (0.5 thresh)"),
+               size = 3, alpha = 0.7) +
+    scale_shape_manual(
+      name   = "Metric",
+      values = c(
+        "AUC"                    = 16,   # circle
+        "BalAcc (optimal thresh)"= 23,   # filled diamond
+        "BalAcc (0.5 thresh)"    = 22    # filled square
+      )
+    ) +
+    scale_color_manual(
+      name   = "Model type",
+      values = c(
+        "Single gene (LOOCV logistic)" = "steelblue",
+        "Elastic net (LOOCV)"          = "tomato"
+      )
+    ) +
+    geom_vline(xintercept = 0.5, linetype = "dashed", color = "grey50") +
+    geom_vline(xintercept = 0.7, linetype = "dotted", color = "orange") +
+    geom_vline(xintercept = 0.8, linetype = "dotted", color = "red") +
     scale_x_continuous(limits = c(0.4, 1.0), breaks = seq(0.4, 1.0, 0.1)) +
     labs(
-      title    = paste0("Single-gene vs elastic net: AUC & balanced accuracy — ", label,
-                        "\n(circles+CI = AUC | diamonds = BalAcc optimal | squares = BalAcc@0.5)"),
-      x        = "Metric value",
-      y        = "Model",
-      color    = "Model type",
-      shape    = "Model type"
+      title    = paste0("Single-gene vs elastic net: AUC & balanced accuracy — ", label),
+      subtitle = paste0(
+        "Circles+CI=AUC | Diamonds=BalAcc(optimal) | Squares=BalAcc(@0.5)\n",
+        "Enet: AUC=",          round(auc_multi, 3),
+        " [",                  round(enet_boot_res$ci_low, 3), ", ",
+        round(enet_boot_res$ci_high, 3), "]",
+        "  BalAcc(opt)=",      round(enet_balacc_opt * 100, 1), "%",
+        "  Sens=",             round(enet_sens_opt   * 100, 1), "%",
+        "  Spec=",             round(enet_spec_opt   * 100, 1), "%"
+      ),
+      x = "Metric value", y = "Model"
     ) +
     theme_bw(base_size = 11) +
-    theme(plot.title      = element_text(face = "bold", size = 10),
-          legend.position = "bottom")
+    theme(
+      plot.title    = element_text(face = "bold", size = 10),
+      plot.subtitle = element_text(size = 8, color = "grey30"),
+      legend.position = "bottom"
+    )
   
   ggsave(file.path(output_dir, paste0("comparison_singlegene_vs_enet_", label, "_", today, ".pdf")),
-         p_compare, width = 9, height = max(5, nrow(comparison_df) * 0.45), device = cairo_pdf)
+         p_compare,
+         width  = 9,
+         height = max(5, nrow(comparison_df) * 0.45),
+         device = cairo_pdf)
+  # ── Bootstrap CIs for elastic net coefficients ───────────────────────────
+  set.seed(42)
+  coef_boot_list <- lapply(1:B_boot, function(b) {
+    idx_b   <- sample(1:length(y), replace = TRUE)
+    y_b     <- y[idx_b]
+    X_full_b <- X_full[idx_b, , drop = FALSE]
+    
+    # Skip degenerate bootstrap samples
+    if (length(unique(y_b)) < 2) return(NULL)
+    
+    fit_b <- tryCatch(
+      cv.glmnet(x = X_full_b, y = y_b, family = "binomial",
+                alpha = alpha_val, nfolds = min(5, length(y_b)),
+                type.measure = "class", penalty.factor = penalty_factors,
+                standardize = TRUE),
+      error = function(e) NULL
+    )
+    if (is.null(fit_b)) return(NULL)
+    
+    cf <- coef(fit_b, s = "lambda.min")
+    data.frame(
+      feature = rownames(cf)[-1],
+      coef    = as.numeric(cf)[-1],
+      stringsAsFactors = FALSE
+    )
+  })
+  
+  coef_boot_df <- do.call(rbind, Filter(Negate(is.null), coef_boot_list))
+  
+  # Summarise: mean, CI, selection frequency per feature
+  coef_boot_summary <- coef_boot_df %>%
+    group_by(feature) %>%
+    summarise(
+      coef_mean      = mean(coef,        na.rm = TRUE),
+      coef_ci_low    = quantile(coef, 0.025, na.rm = TRUE),
+      coef_ci_high   = quantile(coef, 0.975, na.rm = TRUE),
+      selection_freq = mean(coef != 0,   na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  # Merge CIs into coef_df (which has the point estimates from full-data fit)
+  coef_df <- merge(coef_df, coef_boot_summary, by = "feature", all.x = TRUE)
+  coef_df <- coef_df[order(-abs(coef_df$coef)), ]
+  
+  write.csv(coef_df,
+            file.path(output_dir, paste0("elastic_net_coefficients_", label, "_", today, ".csv")),
+            row.names = FALSE)
   
   if (nrow(coef_df) > 0) {
     coef_df$direction <- ifelse(coef_df$coef > 0, "Higher in AD", "Lower in AD")
+    
     p_coef <- ggplot(coef_df,
-                     aes(x = coef, y = reorder(gene_symbol, abs(coef)), fill = direction)) +
-      geom_col(alpha = 0.85) +
+                     aes(x = coef, y = reorder(gene_symbol, abs(coef)),
+                         fill = direction)) +
+      geom_col(alpha = 0.6, width = 0.6) +
+      # Bootstrap 95% CI error bars
+      geom_errorbarh(aes(xmin = coef_ci_low, xmax = coef_ci_high),
+                     height = 0.3, linewidth = 0.7, color = "grey30") +
+      geom_point(aes(x = coef, color = direction), size = 2.5) +
+      # Selection frequency as text label
+      geom_text(aes(x = ifelse(coef >= 0, coef_ci_high, coef_ci_low),
+                    label = paste0(round(selection_freq * 100), "%")),
+                hjust = ifelse(coef_df$coef >= 0, -0.15, 1.15),
+                size = 3, color = "grey30") +
       geom_vline(xintercept = 0, color = "black", linewidth = 0.5) +
-      scale_fill_manual(values = c("Higher in AD" = "tomato", "Lower in AD" = "steelblue")) +
-      labs(title = paste0("Elastic Net Selected Genes — ", label),
-           subtitle = paste0(
-             "AUC: ",          round(auc_multi, 3),
-             " [",             round(boot_res$ci_low, 3), ", ", round(boot_res$ci_high, 3), "]",
-             "  |  BalAcc(opt thresh=", round(enet_opt_thresh, 2), "): ",
-             round(enet_balacc_opt * 100, 1), "%",
-             "  |  Sens: ",   round(enet_sens_opt   * 100, 1), "%",
-             "  |  Spec: ",   round(enet_spec_opt   * 100, 1), "%",
-             "  |  BalAcc(0.5): ", round(enet_balacc_05 * 100, 1), "%",
-             "  |  adj. age+sex"
-           ),
-           x = "Coefficient", y = "Gene", fill = "Direction") +
+      scale_fill_manual(values  = c("Higher in AD" = "tomato",  "Lower in AD" = "steelblue")) +
+      scale_color_manual(values = c("Higher in AD" = "tomato",  "Lower in AD" = "steelblue"),
+                         guide  = "none") +
+      labs(
+        title    = paste0("Elastic Net Selected Genes — ", label),
+        subtitle = paste0(
+          "AUC: ",        round(auc_multi, 3),
+          " [",           round(boot_res$ci_low, 3), ", ", round(boot_res$ci_high, 3), "]",
+          "  BalAcc(opt)=", round(enet_balacc_opt * 100, 1), "%",
+          "  Sens=",      round(enet_sens_opt * 100, 1), "%",
+          "  Spec=",      round(enet_spec_opt * 100, 1), "%\n",
+          "Bars=bootstrap 95% CI | % label=selection frequency across ", B_boot, " bootstraps"
+        ),
+        x    = "Coefficient (full-data fit)",
+        y    = "Gene",
+        fill = "Direction"
+      ) +
       theme_bw(base_size = 11) +
-      theme(plot.title = element_text(face = "bold"), legend.position = "bottom")
+      theme(
+        plot.title    = element_text(face = "bold", size = 10),
+        plot.subtitle = element_text(size = 8, color = "grey30"),
+        legend.position = "bottom"
+      ) +
+      # Extra x margin to fit selection frequency labels
+      scale_x_continuous(expand = expansion(mult = c(0.15, 0.15)))
+    
     ggsave(file.path(output_dir, paste0("elastic_net_coef_", label, "_", today, ".pdf")),
-           p_coef, width = 7, height = max(4, nrow(coef_df) * 0.35), device = cairo_pdf)
+           p_coef,
+           width  = 7,
+           height = max(4, nrow(coef_df) * 0.45),
+           device = cairo_pdf)
   }
   
   cat("Dataset", label, "done.\n")
