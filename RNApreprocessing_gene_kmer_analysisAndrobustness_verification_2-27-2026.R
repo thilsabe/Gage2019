@@ -1478,32 +1478,50 @@ run_analysis <- function(X, y, meta_use, dname, label, ensembl_ids, hgnc_symbols
     for (i in 1:n) {
       train_idx <- setdiff(1:n, i)
       
-      df_train <- data.frame(
-        y   = y[train_idx],
-        x   = X[train_idx, g],
-        sex = as.factor(meta_use$Sex[train_idx]),
-        age = as.numeric(meta_use$Age[train_idx])
+      # Build design matrix: gene + age + sex (sex unpenalized via penalty.factor)
+      sex_train <- ifelse(toupper(meta_use$Sex[train_idx]) == "M", 1, 0)
+      sex_test  <- ifelse(toupper(meta_use$Sex[i])         == "M", 1, 0)
+      
+      X_train <- cbind(
+        gene = X[train_idx, g],
+        age  = as.numeric(meta_use$Age[train_idx]),
+        sex  = sex_train
       )
-      df_test <- data.frame(
-        x   = X[i, g],
-        sex = as.factor(meta_use$Sex[i]),
-        age = as.numeric(meta_use$Age[i])
+      X_test <- matrix(c(
+        X[i, g],
+        as.numeric(meta_use$Age[i]),
+        sex_test
+      ), nrow = 1, dimnames = list(NULL, c("gene", "age", "sex")))
+      
+      y_train <- y[train_idx]
+      
+      # Skip if zero variance in gene or outcome is single class
+      if (var(X_train[, "gene"]) == 0 || length(unique(y_train)) < 2) {
+        pred_all[i] <- 0.5; next
+      }
+      
+      # Penalize gene only; age + sex are unpenalized covariates
+      pf <- c(gene = 1, age = 0, sex = 0)
+      
+      fit_cv <- tryCatch(
+        cv.glmnet(
+          x              = X_train,
+          y              = y_train,
+          family         = "binomial",
+          alpha          = alpha_val,
+          penalty.factor = pf,
+          nfolds         = min(5, length(y_train)),
+          type.measure   = "class",   # optimise accuracy
+          standardize    = TRUE
+        ),
+        error = function(e) NULL
       )
       
-      has_sex_variance <- length(unique(df_train$sex)) > 1
-      formula_i <- if (has_sex_variance) y ~ x + sex + age else y ~ x + age
+      if (is.null(fit_cv)) { pred_all[i] <- 0.5; next }
       
-      fit <- tryCatch(
-        glm(formula_i, data = df_train, family = binomial()),
-        error   = function(e) NULL,
-        warning = function(w) suppressWarnings(
-          glm(formula_i, data = df_train, family = binomial())
-        )
-      )
-      
-      if (is.null(fit)) { pred_all[i] <- 0.5; next }
       pred_all[i] <- tryCatch(
-        predict(fit, newdata = df_test, type = "response"),
+        as.numeric(predict(fit_cv, newx = X_test,
+                           s = "lambda.min", type = "response")),
         error = function(e) 0.5
       )
     }
@@ -1796,24 +1814,18 @@ run_analysis <- function(X, y, meta_use, dname, label, ensembl_ids, hgnc_symbols
   )
   
   # ── Build per_gene_df ─────────────────────────────────────────────────────
-  per_gene_df <- data.frame(
-    ensembl_id  = ensembl_ids,
-    gene_symbol = hgnc_symbols,
-    auc         = as.numeric(auc_vec),
-    ci_low      = as.numeric(ci_low_vec),
-    ci_high     = as.numeric(ci_high_vec)
-  )
+  # Pull per-gene stats directly from gene_summary_df which is already correctly computed
+  # Do NOT rebuild from auc_vec/ci_low_vec/ci_high_vec — those vectors are indexed by
+  # gene name position and can misalign after merge with ensembl_ids/hgnc_symbols vectors.
+  per_gene_df <- gene_summary_df[, c("ensembl_id", "gene_symbol", "auc", "ci_low", "ci_high",
+                                     "balanced_acc_opt", "balanced_acc_05", "opt_threshold",
+                                     "sensitivity_opt", "specificity_opt")]
   
-  # Merge balanced accuracy into per_gene_df
-  per_gene_df <- merge(per_gene_df,
-                       gene_summary_df[, c("ensembl_id", "balanced_acc_opt",
-                                           "balanced_acc_05", "opt_threshold",
-                                           "sensitivity_opt", "specificity_opt")],
-                       by = "ensembl_id", all.x = TRUE)
-  
-  # Sort by balanced accuracy (not AUC)
+  # Sort by balanced accuracy
   per_gene_df_sorted <- per_gene_df[!is.na(per_gene_df$auc), ]
   per_gene_df_sorted <- per_gene_df_sorted[order(-per_gene_df_sorted$balanced_acc_opt), ]
+  stopifnot(all(per_gene_df_sorted$auc == per_gene_df_sorted$auc[
+    match(per_gene_df_sorted$ensembl_id, per_gene_df_sorted$ensembl_id)]))
   per_gene_df_sorted$strength <- cut(
     per_gene_df_sorted$auc,
     breaks = c(0, 0.6, 0.7, 0.8, 0.9, 1.0),
@@ -1872,6 +1884,31 @@ run_analysis <- function(X, y, meta_use, dname, label, ensembl_ids, hgnc_symbols
   write.csv(boot_df,
             file.path(output_dir, paste0("multigene_bootstrap_auc_", label, "_", today, ".csv")),
             row.names = FALSE)
+  
+  # ── Elastic net balanced accuracy stats (needed for all downstream plots) ──
+  roc_enet_obj <- tryCatch(
+    roc(response = y, predictor = pred_multi, quiet = TRUE),
+    error = function(e) NULL
+  )
+  
+  if (!is.null(roc_enet_obj)) {
+    bc_enet <- tryCatch(
+      coords(roc_enet_obj, "best", best.method = "youden",
+             ret = c("threshold", "sensitivity", "specificity")),
+      error = function(e) data.frame(threshold = 0.5, sensitivity = NA, specificity = NA)
+    )
+    enet_opt_thresh <- if (nrow(bc_enet) > 1) bc_enet$threshold[1] else bc_enet$threshold
+    enet_opt_thresh <- if (is.na(enet_opt_thresh) || length(enet_opt_thresh) == 0) 0.5 else enet_opt_thresh
+  } else {
+    enet_opt_thresh <- 0.5
+  }
+  
+  enet_sens_opt   <- sum((pred_multi >= enet_opt_thresh) & (y == 1)) / max(1, sum(y == 1))
+  enet_spec_opt   <- sum((pred_multi <  enet_opt_thresh) & (y == 0)) / max(1, sum(y == 0))
+  enet_balacc_opt <- (enet_sens_opt + enet_spec_opt) / 2
+  enet_sens_05    <- sum((pred_multi >= 0.5) & (y == 1)) / max(1, sum(y == 1))
+  enet_spec_05    <- sum((pred_multi <  0.5) & (y == 0)) / max(1, sum(y == 0))
+  enet_balacc_05  <- (enet_sens_05 + enet_spec_05) / 2
   
   sex_numeric     <- ifelse(toupper(meta_use$Sex) == "M", 1, 0)
   cov_mat         <- cbind(Age = as.numeric(meta_use$Age), Sex = sex_numeric)
@@ -1989,17 +2026,29 @@ run_analysis <- function(X, y, meta_use, dname, label, ensembl_ids, hgnc_symbols
     geom_vline(xintercept = auc_multi,        color = "red",     linewidth = 1.1) +
     geom_vline(xintercept = boot_res$ci_low,  color = "red",     linetype = "dashed") +
     geom_vline(xintercept = boot_res$ci_high, color = "red",     linetype = "dashed") +
+    geom_vline(xintercept = enet_balacc_opt,  color = "tomato",  linetype = "dashed", linewidth = 1.0) +
+    geom_vline(xintercept = enet_balacc_05,   color = "salmon",  linetype = "dashed", linewidth = 0.8) +
     geom_vline(xintercept = 0.7,              color = "orange",  linetype = "dotted") +
     geom_vline(xintercept = 0.8,              color = "darkred", linetype = "dotted") +
     annotate("text", x = auc_multi, y = Inf,
              label = paste0("AUC=", round(auc_multi, 3), " (", auc_strength, ")"),
              vjust = 2, hjust = -0.1, color = "red", size = 3.5) +
+    annotate("text", x = enet_balacc_opt, y = Inf,
+             label = paste0("BalAcc(opt thresh=", round(enet_opt_thresh, 2), ")=",
+                            round(enet_balacc_opt, 3)),
+             vjust = 4, hjust = -0.05, color = "tomato", size = 3.2) +
+    annotate("text", x = enet_balacc_05, y = Inf,
+             label = paste0("BalAcc(@0.5)=", round(enet_balacc_05, 3)),
+             vjust = 6, hjust = -0.05, color = "salmon", size = 3.2) +
     theme_bw(base_size = 10) +
-    labs(title = paste0("Multigene LOOCV AUC (adj. age+sex) - ", label,
-                        "\nMean: ", round(boot_res$mean, 3),
-                        " CI [", round(boot_res$ci_low, 3),
-                        ", ", round(boot_res$ci_high, 3), "]"),
-         x = "AUC", y = "Count")
+    labs(title = paste0("Multigene LOOCV — ", label,
+                        "\nAUC: ", round(boot_res$mean, 3),
+                        " CI [", round(boot_res$ci_low, 3), ", ", round(boot_res$ci_high, 3), "]",
+                        "  |  BalAcc(opt): ", round(enet_balacc_opt * 100, 1), "%",
+                        "  |  Sens: ",        round(enet_sens_opt   * 100, 1), "%",
+                        "  |  Spec: ",        round(enet_spec_opt   * 100, 1), "%",
+                        "  |  BalAcc(0.5): ", round(enet_balacc_05  * 100, 1), "%"),
+         x = "Bootstrap AUC", y = "Count")
   ggsave(file.path(output_dir, paste0("multigene_bootstrap_auc_hist_", label, "_", today, ".png")),
          p_boot, width = 6, height = 4, dpi = 300)
   
@@ -2012,13 +2061,6 @@ run_analysis <- function(X, y, meta_use, dname, label, ensembl_ids, hgnc_symbols
     if (nrow(bc) > 1) bc$threshold[1] else bc$threshold
   }, error = function(e) 0.5)
   enet_opt_thresh  <- if (is.na(enet_opt_thresh) || length(enet_opt_thresh) == 0) 0.5 else enet_opt_thresh
-  
-  enet_sens_opt    <- sum((pred_multi >= enet_opt_thresh) & (y == 1)) / max(1, sum(y == 1))
-  enet_spec_opt    <- sum((pred_multi <  enet_opt_thresh) & (y == 0)) / max(1, sum(y == 0))
-  enet_balacc_opt  <- (enet_sens_opt + enet_spec_opt) / 2
-  enet_sens_05     <- sum((pred_multi >= 0.5) & (y == 1)) / max(1, sum(y == 1))
-  enet_spec_05     <- sum((pred_multi <  0.5) & (y == 0)) / max(1, sum(y == 0))
-  enet_balacc_05   <- (enet_sens_05 + enet_spec_05) / 2
   
   # Build comparison table: top 10 per-gene + elastic net row
   top10_compare <- head(gene_summary_df, 10)[, c("gene_symbol", "auc", "ci_low", "ci_high",
@@ -2085,10 +2127,17 @@ run_analysis <- function(X, y, meta_use, dname, label, ensembl_ids, hgnc_symbols
       geom_col(alpha = 0.85) +
       geom_vline(xintercept = 0, color = "black", linewidth = 0.5) +
       scale_fill_manual(values = c("Higher in AD" = "tomato", "Lower in AD" = "steelblue")) +
-      labs(title = paste0("Elastic Net Selected Genes - ", label,
-                          "\n(LOOCV AUC: ", round(auc_multi, 3),
-                          " [", round(boot_res$ci_low, 3), ", ",
-                          round(boot_res$ci_high, 3), "] | adj. age+sex)"),
+      labs(title = paste0("Elastic Net Selected Genes — ", label),
+           subtitle = paste0(
+             "AUC: ",          round(auc_multi, 3),
+             " [",             round(boot_res$ci_low, 3), ", ", round(boot_res$ci_high, 3), "]",
+             "  |  BalAcc(opt thresh=", round(enet_opt_thresh, 2), "): ",
+             round(enet_balacc_opt * 100, 1), "%",
+             "  |  Sens: ",   round(enet_sens_opt   * 100, 1), "%",
+             "  |  Spec: ",   round(enet_spec_opt   * 100, 1), "%",
+             "  |  BalAcc(0.5): ", round(enet_balacc_05 * 100, 1), "%",
+             "  |  adj. age+sex"
+           ),
            x = "Coefficient", y = "Gene", fill = "Direction") +
       theme_bw(base_size = 11) +
       theme(plot.title = element_text(face = "bold"), legend.position = "bottom")
@@ -2115,7 +2164,7 @@ run_analysis <- function(X, y, meta_use, dname, label, ensembl_ids, hgnc_symbols
 
 # ── Run ───────────────────────────────────────────────────────────────────────
 sex_chr_patterns <- "XIST|DDX3Y|USP9Y|RPS4Y1|ZFY|TSIX|EIF1AY|KDM5D|NLGN4Y|TMSB4Y|UTY|PRKY|PCDH11Y"
-output_dir <- "/home/thilsabeck/Documents/Gage2024/RNApreprocessing_gene_validation_files/AgeSex_confounds_residuals/"
+output_dir <- "/home/thilsabeck/Documents/Gage2024/RNApreprocessing_gene_validation_files/AgeSex_confounds_residuals_accuracyFit/"
 if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
 alpha_val <- 0.5
 B_boot    <- 1000
