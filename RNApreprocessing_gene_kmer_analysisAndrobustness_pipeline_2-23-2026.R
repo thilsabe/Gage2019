@@ -2,6 +2,16 @@
 # RNApreprocessing_gene_kmer_analysisAndrobustness_pipeline.R
 # Full Robustness Pipeline — HPC-Optimized + Parallel + Bayesian + Publication Ready
 
+# Prevent broken rstan from loading — use cmdstanr throughout
+options(brms.backend  = "cmdstanr")
+options(mc.cores      = parallel::detectCores())
+
+# Intercept any attempt to load rstan
+.rstan_blocked <- TRUE
+if (!"cmdstanr" %in% rownames(installed.packages())) {
+  stop("cmdstanr required — install with: install.packages('cmdstanr', repos='https://mc-stan.org/r-packages/')")
+}
+
 suppressPackageStartupMessages({
   library(data.table)
   library(tidyverse)
@@ -25,6 +35,7 @@ suppressPackageStartupMessages({
   library(universalmotif)
   library(ggseqlogo)
   library(Biostrings)
+  library(cmdstanr)
 })
 
 # Prevent dplyr from masking data.table functions
@@ -32,13 +43,13 @@ first <- data.table::first
 last  <- data.table::last
 
 # Setting memory usage per core for future.apply (adjust as needed for your HPC environment)
-options(future.globals.maxSize = 1000 * 1024^2)  # 500MB per worker
+options(future.globals.maxSize = 10000 * 1024^2)  # 500MB per worker
 
 # ============================================================
 # 0. CONFIGURATION
 # ============================================================
 
-n_cores <- 24      # increase to 32 for full HPC runs
+n_cores <- 16      # increase to 32 for full HPC runs
 testrun <- FALSE   # set FALSE for full production run
 handlers("txtprogressbar")
 
@@ -80,14 +91,25 @@ plan(multicore, workers = n_cores)
 # ============================================================
 # 1. LOAD REFERENCE FILES
 # ============================================================
-
 cat("Loading reference files...\n")
 kmer_gene_map <- fread(kmer_map_file)
-kmer_gene_map <- kmer_gene_map[, .(kmer, kmer_chrom, kmer_start, kmer_end,
-                                    ensembl_id, gene_symbol)]
-kmer_features <- fread(kmer_features_file)
+cat("  kmer_gene_map raw columns:", paste(names(kmer_gene_map), collapse=", "), "\n")
 
-cat("  kmer_gene_map:", nrow(kmer_gene_map), "rows\n")
+# Select only columns that exist
+base_cols     <- c("kmer", "kmer_chrom", "kmer_start", "kmer_end", "ensembl_id")
+opt_cols      <- c("gene_symbol")
+keep_cols     <- c(base_cols, intersect(opt_cols, names(kmer_gene_map)))
+kmer_gene_map <- kmer_gene_map[, ..keep_cols]
+
+# Add gene_symbol as NA if missing
+if (!"gene_symbol" %in% names(kmer_gene_map)) {
+  kmer_gene_map[, gene_symbol := NA_character_]
+  cat("  [INFO] gene_symbol not in kmer_gene_map — filled with NA\n")
+}
+cat("  kmer_gene_map:", nrow(kmer_gene_map), "rows |",
+    "gene_symbol present:", sum(!is.na(kmer_gene_map$gene_symbol)), "\n")
+
+kmer_features <- fread(kmer_features_file)
 cat("  kmer_features:", nrow(kmer_features), "rows\n")
 
 # Collapse kmer_features to one row per kmer — done once globally
@@ -104,7 +126,9 @@ kmer_features_collapsed <- kmer_features[, .(
   has_gene          = any(has_gene),
   n_genes_mapped    = uniqueN(ensembl_id[ensembl_id != "unassigned"]),
   ensembl_id        = ensembl_id[ensembl_id != "unassigned"][1],
-  gene_symbol       = gene_symbol[gene_symbol != "unassigned"][1]
+  gene_symbol       = if ("gene_symbol" %in% names(.SD))
+    gene_symbol[gene_symbol != "unassigned"][1]
+  else NA_character_
 ), by=kmer]
 cat("  kmer_features_collapsed:", nrow(kmer_features_collapsed), "unique kmers\n")
 
@@ -470,6 +494,296 @@ compute_jaccard <- function(method_list) {
 }
 
 # ============================================================
+# GLMM ANALYSIS FUNCTION
+# Fits a generalized linear mixed model to test whether
+# pipeline dimensions (aligner, trimmer, counter) predict
+# kmer detection, with gene as a random effect to account
+# for gene-level clustering
+# ============================================================
+run_glmm_analysis <- function(dt, grouping_type, fixed_value,
+                              deg_name, out_dir, today,
+                              min_rows=100L) {
+  
+  if (nrow(dt) < min_rows) {
+    cat(sprintf("  [SKIP] GLMM: too few rows (%d < %d)\n", nrow(dt), min_rows))
+    return(invisible(NULL))
+  }
+  
+  required_pkgs <- c("lme4", "broom.mixed")
+  missing_pkgs  <- required_pkgs[!sapply(required_pkgs, requireNamespace, quietly=TRUE)]
+  if (length(missing_pkgs) > 0) {
+    cat(sprintf("  [SKIP] GLMM: missing packages: %s\n",
+                paste(missing_pkgs, collapse=", ")))
+    return(invisible(NULL))
+  }
+  
+  suppressPackageStartupMessages({
+    library(lme4)
+    library(broom.mixed)
+  })
+  
+  results <- list()
+  
+  # vary_col = the dimension varying across col 1 of the DEG file
+  # fastq_trimmer = FASTQ preprocessing trimmer — always independent
+  # of vary_col regardless of grouping_type, since kmer files are
+  # loaded across all 4 FASTQ trimmers for every DEG set
+  vary_col <- switch(grouping_type,
+                     "aligner" = "aligner",
+                     "trimmer" = "deg_list_trimmer",
+                     "counter" = "counter",
+                     NULL
+  )
+  
+  has_vary        <- !is.null(vary_col) &&
+    vary_col %in% names(dt) &&
+    uniqueN(dt[[vary_col]][!is.na(dt[[vary_col]])]) > 1
+  
+  has_fastq_trimmer <- "fastq_trimmer" %in% names(dt) &&
+    uniqueN(dt$fastq_trimmer[!is.na(dt$fastq_trimmer)]) > 1
+  
+  cat(sprintf("  GLMM: vary_col=%s (n=%d) | fastq_trimmer=%s (n=%d) | grouping=%s\n",
+              vary_col %||% "none",
+              if (has_vary) uniqueN(dt[[vary_col]], na.rm=TRUE) else 0,
+              ifelse(has_fastq_trimmer, "included", "excluded"),
+              if (has_fastq_trimmer) uniqueN(dt$fastq_trimmer, na.rm=TRUE) else 0,
+              grouping_type))
+  
+  # --- Model 1: Varying dimension only ---
+  if (has_vary) {
+    tryCatch({
+      dt_model <- dt[!is.na(get(vary_col)) & !is.na(ensembl_id) & !is.na(DEG_binary)]
+      dt_model[, vary := as.factor(get(vary_col))]
+      dt_model[, gene := as.factor(ensembl_id)]
+      
+      fit <- glmer(
+        DEG_binary ~ vary + (1 | gene),
+        data    = dt_model,
+        family  = binomial(),
+        control = glmerControl(optimizer="bobyqa", optCtrl=list(maxfun=1e5))
+      )
+      coefs <- as.data.table(tidy(fit, effects="fixed"))
+      coefs[, model       := paste0(vary_col, "_only")]
+      coefs[, vary_col    := vary_col]
+      coefs[, fixed_value := fixed_value]
+      coefs[, deg_set     := deg_name]
+      results[["vary_dim"]] <- coefs
+      cat(sprintf("  GLMM %s_only: AIC=%.1f\n", vary_col, AIC(fit)))
+    }, error = function(e) {
+      cat(sprintf("  [WARNING] GLMM vary_dim failed: %s\n", e$message))
+    })
+  }
+  
+  # --- Model 2: fastq_trimmer only ---
+  if (has_fastq_trimmer) {
+    tryCatch({
+      dt_model <- dt[!is.na(fastq_trimmer) & !is.na(ensembl_id) & !is.na(DEG_binary)]
+      dt_model[, trimmer_f := as.factor(fastq_trimmer)]
+      dt_model[, gene      := as.factor(ensembl_id)]
+      
+      fit <- glmer(
+        DEG_binary ~ trimmer_f + (1 | gene),
+        data    = dt_model,
+        family  = binomial(),
+        control = glmerControl(optimizer="bobyqa", optCtrl=list(maxfun=1e5))
+      )
+      coefs <- as.data.table(tidy(fit, effects="fixed"))
+      coefs[, model       := "fastq_trimmer_only"]
+      coefs[, vary_col    := "fastq_trimmer"]
+      coefs[, fixed_value := fixed_value]
+      coefs[, deg_set     := deg_name]
+      results[["fastq_trimmer"]] <- coefs
+      cat(sprintf("  GLMM fastq_trimmer_only: AIC=%.1f\n", AIC(fit)))
+    }, error = function(e) {
+      cat(sprintf("  [WARNING] GLMM fastq_trimmer failed: %s\n", e$message))
+    })
+  }
+  
+  # --- Model 3: vary_dim + fastq_trimmer additive ---
+  if (has_vary && has_fastq_trimmer) {
+    tryCatch({
+      dt_model <- dt[!is.na(get(vary_col)) & !is.na(fastq_trimmer) &
+                       !is.na(ensembl_id)  & !is.na(DEG_binary)]
+      dt_model[, vary      := as.factor(get(vary_col))]
+      dt_model[, trimmer_f := as.factor(fastq_trimmer)]
+      dt_model[, gene      := as.factor(ensembl_id)]
+      
+      fit <- glmer(
+        DEG_binary ~ vary + trimmer_f + (1 | gene),
+        data    = dt_model,
+        family  = binomial(),
+        control = glmerControl(optimizer="bobyqa", optCtrl=list(maxfun=1e5))
+      )
+      coefs <- as.data.table(tidy(fit, effects="fixed"))
+      coefs[, model       := paste0(vary_col, "_plus_fastq_trimmer")]
+      coefs[, vary_col    := vary_col]
+      coefs[, fixed_value := fixed_value]
+      coefs[, deg_set     := deg_name]
+      results[["vary_plus_trimmer"]] <- coefs
+      cat(sprintf("  GLMM %s+fastq_trimmer: AIC=%.1f\n", vary_col, AIC(fit)))
+    }, error = function(e) {
+      cat(sprintf("  [WARNING] GLMM vary+trimmer additive failed: %s\n", e$message))
+    })
+  }
+  
+  # --- Model 4: vary_dim x fastq_trimmer interaction ---
+  # For trimmer files this tests: does the DEG-calling trimmer effect
+  # on kmer detection depend on which FASTQ preprocessing trimmer was used?
+  # For aligner files: does aligner effect depend on FASTQ preprocessing?
+  if (has_vary && has_fastq_trimmer) {
+    tryCatch({
+      dt_model <- dt[!is.na(get(vary_col)) & !is.na(fastq_trimmer) &
+                       !is.na(ensembl_id)  & !is.na(DEG_binary)]
+      dt_model[, vary      := as.factor(get(vary_col))]
+      dt_model[, trimmer_f := as.factor(fastq_trimmer)]
+      dt_model[, gene      := as.factor(ensembl_id)]
+      
+      fit <- glmer(
+        DEG_binary ~ vary * trimmer_f + (1 | gene),
+        data    = dt_model,
+        family  = binomial(),
+        control = glmerControl(optimizer="bobyqa", optCtrl=list(maxfun=2e5))
+      )
+      coefs <- as.data.table(tidy(fit, effects="fixed"))
+      coefs[, model       := paste0(vary_col, "_x_fastq_trimmer")]
+      coefs[, vary_col    := vary_col]
+      coefs[, fixed_value := fixed_value]
+      coefs[, deg_set     := deg_name]
+      results[["vary_x_trimmer"]] <- coefs
+      cat(sprintf("  GLMM %s x fastq_trimmer: AIC=%.1f\n", vary_col, AIC(fit)))
+    }, error = function(e) {
+      cat(sprintf("  [WARNING] GLMM vary x fastq_trimmer interaction failed: %s\n",
+                  e$message))
+    })
+  }
+  
+  # --- Model 5: kmer entropy ---
+  if ("kmer_entropy" %in% names(dt) &&
+      sum(!is.na(dt$kmer_entropy)) > min_rows) {
+    tryCatch({
+      dt_model <- dt[!is.na(kmer_entropy) & !is.na(ensembl_id) & !is.na(DEG_binary)]
+      dt_model[, gene := as.factor(ensembl_id)]
+      
+      fit <- glmer(
+        DEG_binary ~ scale(kmer_entropy) + (1 | gene),
+        data    = dt_model,
+        family  = binomial(),
+        control = glmerControl(optimizer="bobyqa", optCtrl=list(maxfun=1e5))
+      )
+      coefs <- as.data.table(tidy(fit, effects="fixed"))
+      coefs[, model       := "entropy_vs_detection"]
+      coefs[, fixed_value := fixed_value]
+      coefs[, deg_set     := deg_name]
+      results[["entropy"]] <- coefs
+      cat(sprintf("  GLMM entropy: AIC=%.1f\n", AIC(fit)))
+    }, error = function(e) {
+      cat(sprintf("  [WARNING] GLMM entropy failed: %s\n", e$message))
+    })
+  }
+  
+  # --- Model 6: GC content ---
+  if ("gc_content" %in% names(dt) &&
+      sum(!is.na(dt$gc_content)) > min_rows) {
+    tryCatch({
+      dt_model <- dt[!is.na(gc_content) & !is.na(ensembl_id) & !is.na(DEG_binary)]
+      dt_model[, gene := as.factor(ensembl_id)]
+      
+      fit <- glmer(
+        DEG_binary ~ scale(gc_content) + (1 | gene),
+        data    = dt_model,
+        family  = binomial(),
+        control = glmerControl(optimizer="bobyqa", optCtrl=list(maxfun=1e5))
+      )
+      coefs <- as.data.table(tidy(fit, effects="fixed"))
+      coefs[, model       := "gc_content_vs_detection"]
+      coefs[, fixed_value := fixed_value]
+      coefs[, deg_set     := deg_name]
+      results[["gc"]] <- coefs
+      cat(sprintf("  GLMM gc_content: AIC=%.1f\n", AIC(fit)))
+    }, error = function(e) {
+      cat(sprintf("  [WARNING] GLMM gc_content failed: %s\n", e$message))
+    })
+  }
+  
+  # --- Model 7: Full model ---
+  # vary_col + fastq_trimmer + entropy + gc + vary:entropy + fastq_trimmer:entropy
+  if (has_vary && "kmer_entropy" %in% names(dt) && "gc_content" %in% names(dt)) {
+    tryCatch({
+      base_cols <- c(vary_col, "ensembl_id", "DEG_binary",
+                     "kmer_entropy", "gc_content")
+      if (has_fastq_trimmer) base_cols <- c(base_cols, "fastq_trimmer")
+      
+      dt_model <- dt[rowSums(is.na(.SD[, ..base_cols])) == 0]
+      dt_model[, vary := as.factor(get(vary_col))]
+      dt_model[, gene := as.factor(ensembl_id)]
+      
+      formula_str <- if (has_fastq_trimmer) {
+        dt_model[, trimmer_f := as.factor(fastq_trimmer)]
+        paste0("DEG_binary ~ vary + trimmer_f + scale(kmer_entropy) +",
+               " scale(gc_content) + vary:scale(kmer_entropy) +",
+               " trimmer_f:scale(kmer_entropy) + (1 | gene)")
+      } else {
+        paste0("DEG_binary ~ vary + scale(kmer_entropy) +",
+               " scale(gc_content) + vary:scale(kmer_entropy) + (1 | gene)")
+      }
+      
+      fit <- glmer(
+        as.formula(formula_str),
+        data    = dt_model,
+        family  = binomial(),
+        control = glmerControl(optimizer="bobyqa", optCtrl=list(maxfun=2e5))
+      )
+      coefs <- as.data.table(tidy(fit, effects="fixed"))
+      coefs[, model       := "full_model"]
+      coefs[, vary_col    := vary_col]
+      coefs[, fixed_value := fixed_value]
+      coefs[, deg_set     := deg_name]
+      results[["full"]] <- coefs
+      cat(sprintf("  GLMM full: AIC=%.1f | %d terms\n", AIC(fit), nrow(coefs)))
+    }, error = function(e) {
+      cat(sprintf("  [WARNING] GLMM full model failed: %s\n", e$message))
+    })
+  }
+  
+  if (length(results) == 0) return(invisible(NULL))
+  
+  combined <- rbindlist(results, fill=TRUE)
+  combined[, grouping_type := grouping_type]
+  # FDR within each model separately
+  combined[!is.na(p.value) & term != "(Intercept)",
+           padj_within_model := p.adjust(p.value, method="BH"),
+           by=model]
+  # FDR across all terms across all models for this DEG set
+  combined[!is.na(p.value) & term != "(Intercept)",
+           padj_across_models := p.adjust(p.value, method="BH")]
+  fwrite(combined,
+         file.path(out_dir, paste0("glmm_results_", today, ".csv")))
+  
+  # Volcano plot
+  sig_results <- combined[!is.na(p.value) & term != "(Intercept)"]
+  if (nrow(sig_results) > 0) {
+    sig_results[, neg_log10p  := -log10(p.value + 1e-300)]
+    sig_results[, significant := p.value < 0.05]
+    
+    p_glmm <- ggplot(sig_results,
+                     aes(x=estimate, y=neg_log10p,
+                         colour=significant, label=term)) +
+      geom_point(size=2, alpha=0.7) +
+      geom_hline(yintercept=-log10(0.05), linetype="dashed", colour="red") +
+      geom_vline(xintercept=0, linetype="dotted") +
+      facet_wrap(~ model, scales="free") +
+      theme_classic() +
+      labs(title=paste0("GLMM results — ", deg_name),
+           x="Effect size (log-odds)", y="-log10(p-value)",
+           colour="p<0.05")
+    ggsave(file.path(out_dir, paste0("glmm_volcano_", today, ".pdf")),
+           p_glmm, width=14, height=10)
+  }
+  
+  return(combined)
+}
+
+# ============================================================
 # 6. GTF LOOKUP — load once before the loop
 # ============================================================
 
@@ -541,7 +855,7 @@ deg_files <- deg_files[basename(deg_files) %in% priority_deg_files]
 cat("After priority filter:", length(deg_files), "DEG files\n")
 
 if (testrun) {
-  deg_files <- deg_files[seq(1, length(deg_files), by=5)][1:3]
+  deg_files <- deg_files[1:3]#[seq(1, length(deg_files), by=5)][1:3]
   cat("TEST RUN with", length(deg_files), "DEG files\n")
 }
 
@@ -556,6 +870,7 @@ all_kmer_aligner_lists <- list()
 fastq_sensitivity_all  <- list()
 motif_results_all      <- list()
 subkmer_results_all    <- list()
+glmm_results_all       <- list()
 
 for (deg_file in deg_files) {
 
@@ -606,6 +921,7 @@ for (deg_file in deg_files) {
   all_deg_dt[[deg_name]] <- deg_dt[, .(
     aligner          = aligner,
     ensembl_id       = ensembl_id,
+    gene_symbol = if ("gene_symbol" %in% names(.SD)) gene_symbol else NA_character_,
     deg_name         = deg_name,
     deg_list_trimmer = meta$deg_list_trimmer,
     counter          = meta$counter,
@@ -937,8 +1253,12 @@ for (deg_file in deg_files) {
   # 6b. KMER STABILITY ACROSS FASTQ TRIMMERS
   # -------------------------------------------------------
   # Gene-level symbol lookup — one symbol per ensembl_id from kmers_dt
-  gene_symbol_lookup <- unique(kmers_dt[!is.na(gene_symbol) & gene_symbol != "unassigned",
-                                        .(ensembl_id, gene_symbol)])
+  gene_symbol_lookup <- if ("gene_symbol" %in% names(kmers_dt)) {
+    unique(kmers_dt[!is.na(gene_symbol) & gene_symbol != "unassigned",
+                    .(ensembl_id, gene_symbol)])
+  } else {
+    data.table(ensembl_id=character(0), gene_symbol=character(0))
+  }
   gene_symbol_lookup <- gene_symbol_lookup[, .(gene_symbol = gene_symbol[1]), by=ensembl_id]
   
   varying_col <- meta$grouping_type  # "aligner", "trimmer", or "counter"
@@ -1298,7 +1618,8 @@ for (deg_file in deg_files) {
   # -------------------------------------------------------
   # 6d. WITHIN-DEG-SET REPRODUCIBILITY (across methods)
   # -------------------------------------------------------
-  reproducibility <- kmers_dt[, .(N = .N), by=.(ensembl_id)]
+  by_cols <- intersect(c("ensembl_id", "gene_symbol"), names(kmers_dt))
+  reproducibility <- kmers_dt[, .(N = .N), by=by_cols]
   reproducibility[, reproducibility_score := N / length(unique(kmers_dt$method))]
   fwrite(reproducibility,
          file.path(deg_out, paste0("cross_deg_reproducibility_", today, ".csv")))
@@ -1372,6 +1693,29 @@ for (deg_file in deg_files) {
   fwrite(summary_dt,
          file.path(deg_out, paste0("method_summary_", today, ".csv")))
   all_summaries[[deg_name]] <- summary_dt
+  
+  # -------------------------------------------------------
+  # 6i. PER-DEG-SET GLMM ANALYSIS
+  # Tests whether pipeline dimensions predict kmer detection
+  # above and beyond gene-level random effects
+  # -------------------------------------------------------
+  cat("  Running per-DEG-set GLMM analysis...\n")
+  
+  glmm_results_per_deg <- run_glmm_analysis(
+    dt           = kmers_dt,
+    grouping_type = meta$grouping_type,
+    fixed_value  = meta$fixed_value %||% "unknown",
+    deg_name     = deg_name,
+    out_dir      = deg_out,
+    today        = today
+  )
+  
+  if (!is.null(glmm_results_per_deg)) {
+    glmm_results_all[[deg_name]] <- glmm_results_per_deg
+    cat(sprintf("  GLMM: %d models fitted | %d significant terms (p<0.05)\n",
+                uniqueN(glmm_results_per_deg$model),
+                sum(glmm_results_per_deg$p.value < 0.05, na.rm=TRUE)))
+  }
 
   cat("  [DONE]", deg_name, "\n")
 }
@@ -1381,25 +1725,34 @@ for (deg_file in deg_files) {
 # ============================================================
 
 cat("\nCombining all DEG sets...\n")
+
+# Safe reconstruction helper — checks column existence before referencing
+reconstruct_fixed_value <- function(dt) {
+  result <- rep("unknown", nrow(dt))
+  if ("deg_list_trimmer" %in% names(dt)) {
+    mask <- !is.na(dt$deg_list_trimmer) & dt$deg_list_trimmer != ""
+    result[mask] <- dt$deg_list_trimmer[mask]
+  }
+  if ("deg_list_aligner" %in% names(dt)) {
+    mask <- result == "unknown" & !is.na(dt$deg_list_aligner) & dt$deg_list_aligner != ""
+    result[mask] <- dt$deg_list_aligner[mask]
+  }
+  if ("deg_list_counter" %in% names(dt)) {
+    mask <- result == "unknown" & !is.na(dt$deg_list_counter) & dt$deg_list_counter != ""
+    result[mask] <- dt$deg_list_counter[mask]
+  }
+  return(result)
+}
+
 analysis_dt <- rbindlist(full_dataset, fill=TRUE)
 
-# Guard: reconstruct fixed_value if missing from cached/incomplete DEG sets
 if (!"fixed_value" %in% names(analysis_dt)) {
   cat("[WARNING] fixed_value missing from analysis_dt — reconstructing\n")
-  analysis_dt[, fixed_value := fcase(
-    !is.na(deg_list_trimmer) & deg_list_trimmer != "", deg_list_trimmer,
-    !is.na(deg_list_aligner) & deg_list_aligner != "", deg_list_aligner,
-    !is.na(deg_list_counter) & deg_list_counter != "", deg_list_counter,
-    default = "unknown"
-  )]
+  analysis_dt[, fixed_value := reconstruct_fixed_value(analysis_dt)]
 } else if (any(is.na(analysis_dt$fixed_value))) {
-  cat("[WARNING] fixed_value has NAs — filling from deg_list columns\n")
-  analysis_dt[is.na(fixed_value), fixed_value := fcase(
-    !is.na(deg_list_trimmer) & deg_list_trimmer != "", deg_list_trimmer,
-    !is.na(deg_list_aligner) & deg_list_aligner != "", deg_list_aligner,
-    !is.na(deg_list_counter) & deg_list_counter != "", deg_list_counter,
-    default = "unknown"
-  )]
+  cat("[WARNING] fixed_value has NAs — filling\n")
+  na_rows <- is.na(analysis_dt$fixed_value)
+  analysis_dt[na_rows, fixed_value := reconstruct_fixed_value(analysis_dt[na_rows])]
 }
 
 cat("fixed_value distribution:\n")
@@ -1407,20 +1760,17 @@ print(analysis_dt[, .N, by=fixed_value])
 
 # ============================================================
 # CROSS-DEG ANALYSES
-# Uses all_deg_dt — raw DEG gene lists BEFORE kmer merging.
-# Answers: which genes are reproducibly called as DEGs across
-# independent DEG set comparisons, and does this vary by
-# aligner, counter, or trimmer context?
 # ============================================================
 
 all_deg_dt_combined <- rbindlist(all_deg_dt, fill=TRUE)
 
 if (!"fixed_value" %in% names(all_deg_dt_combined)) {
-  all_deg_dt_combined[, fixed_value := fcase(
-    !is.na(deg_list_trimmer) & deg_list_trimmer != "", deg_list_trimmer,
-    !is.na(deg_list_aligner) & deg_list_aligner != "", deg_list_aligner,
-    default = "unknown"
-  )]
+  cat("[WARNING] fixed_value missing from all_deg_dt_combined — reconstructing\n")
+  all_deg_dt_combined[, fixed_value := reconstruct_fixed_value(all_deg_dt_combined)]
+} else if (any(is.na(all_deg_dt_combined$fixed_value))) {
+  na_rows <- is.na(all_deg_dt_combined$fixed_value)
+  all_deg_dt_combined[na_rows,
+                      fixed_value := reconstruct_fixed_value(all_deg_dt_combined[na_rows])]
 }
 
 fwrite(all_deg_dt_combined,
@@ -1429,10 +1779,10 @@ fwrite(all_deg_dt_combined,
 
 # Overall: how many DEG sets does each gene appear in
 gene_cross_deg <- all_deg_dt_combined[, .(
-  n_deg_sets       = uniqueN(deg_name),
-  n_aligners       = uniqueN(aligner),
-  deg_sets_list    = paste(unique(deg_name), collapse="|"),
-  aligners_list    = paste(unique(aligner),  collapse="|")
+  n_deg_sets    = uniqueN(deg_name),
+  n_aligners    = uniqueN(aligner),
+  deg_sets_list = paste(unique(deg_name), collapse="|"),
+  aligners_list = paste(unique(aligner),  collapse="|")
 ), by=ensembl_id]
 gene_cross_deg[, cross_deg_fraction := n_deg_sets / length(deg_files)]
 
@@ -1440,8 +1790,7 @@ fwrite(gene_cross_deg,
        file.path(output_dir, "tables",
                  paste0("gene_cross_deg_reproducibility_", today, ".csv")))
 
-# Per aligner: controls for aligner-specific bias
-# Genes robust within an aligner across DEG sets are aligner-stable
+# Per aligner
 gene_cross_deg_aligner <- all_deg_dt_combined[, .(
   n_deg_sets         = uniqueN(deg_name),
   cross_deg_fraction = uniqueN(deg_name) / length(deg_files)
@@ -1451,7 +1800,7 @@ fwrite(gene_cross_deg_aligner,
        file.path(output_dir, "tables",
                  paste0("gene_cross_deg_per_aligner_", today, ".csv")))
 
-# Per counter: isolates counting-method effect on DEG reproducibility
+# Per counter
 gene_cross_deg_counter <- all_deg_dt_combined[, .(
   n_deg_sets         = uniqueN(deg_name),
   cross_deg_fraction = uniqueN(deg_name) / length(deg_files)
@@ -1461,15 +1810,15 @@ fwrite(gene_cross_deg_counter,
        file.path(output_dir, "tables",
                  paste0("gene_cross_deg_per_counter_", today, ".csv")))
 
-# Per deg_list_trimmer: isolates trimmer-context effect
-gene_cross_deg_trimmer <- all_deg_dt_combined[, .(
+# Per fixed_value (replaces deg_list_trimmer — works for all grouping types)
+gene_cross_deg_fixed <- all_deg_dt_combined[, .(
   n_deg_sets         = uniqueN(deg_name),
   cross_deg_fraction = uniqueN(deg_name) / length(deg_files)
 ), by=.(ensembl_id, fixed_value)]
 
-fwrite(gene_cross_deg_trimmer,
+fwrite(gene_cross_deg_fixed,
        file.path(output_dir, "tables",
-                 paste0("gene_cross_deg_per_trimmer_", today, ".csv")))
+                 paste0("gene_cross_deg_per_fixed_value_", today, ".csv")))
 
 # Cross-DEG summary plots
 p_cross_deg <- ggplot(gene_cross_deg, aes(x=cross_deg_fraction)) +
@@ -1483,7 +1832,7 @@ ggsave(file.path(output_dir, "figures",
        p_cross_deg, width=8, height=6)
 
 p_cross_deg_aligner <- ggplot(gene_cross_deg_aligner,
-                               aes(x=cross_deg_fraction, fill=aligner)) +
+                              aes(x=cross_deg_fraction, fill=aligner)) +
   geom_density(alpha=0.4) +
   theme_classic() +
   labs(title="Cross-DEG gene reproducibility by aligner",
@@ -1492,20 +1841,465 @@ ggsave(file.path(output_dir, "figures",
                  paste0("cross_deg_reproducibility_by_aligner_", today, ".pdf")),
        p_cross_deg_aligner, width=10, height=6)
 
-p_cross_deg_counter <- ggplot(gene_cross_deg_counter,
-                               aes(x=cross_deg_fraction, fill=counter)) +
+p_cross_deg_fixed <- ggplot(gene_cross_deg_fixed,
+                            aes(x=cross_deg_fraction, fill=fixed_value)) +
   geom_density(alpha=0.4) +
   theme_classic() +
-  labs(title="Cross-DEG gene reproducibility by counter",
+  labs(title="Cross-DEG gene reproducibility by fixed dimension",
        x="Fraction of DEG sets gene appeared in", y="Density")
 ggsave(file.path(output_dir, "figures",
-                 paste0("cross_deg_reproducibility_by_counter_", today, ".pdf")),
-       p_cross_deg_counter, width=10, height=6)
+                 paste0("cross_deg_reproducibility_by_fixed_value_", today, ".pdf")),
+       p_cross_deg_fixed, width=10, height=6)
 
 cat("\nCross-DEG summary:\n")
-cat("  Total unique genes across all DEG sets:", uniqueN(all_deg_dt_combined$ensembl_id), "\n")
-cat("  Genes in all DEG sets (fraction=1)    :", sum(gene_cross_deg$cross_deg_fraction == 1), "\n")
-cat("  Genes in >50% of DEG sets             :", sum(gene_cross_deg$cross_deg_fraction > 0.5), "\n")
+cat("  Total unique genes across all DEG sets:",
+    uniqueN(all_deg_dt_combined$ensembl_id), "\n")
+cat("  Genes in all DEG sets (fraction=1)    :",
+    sum(gene_cross_deg$cross_deg_fraction == 1), "\n")
+cat("  Genes in >50% of DEG sets             :",
+    sum(gene_cross_deg$cross_deg_fraction > 0.5), "\n")
+
+# ============================================================
+# COMBINED GLMM ANALYSIS ACROSS ALL DEG SETS
+# Runs on full_dt — the full gene x pipeline combination matrix
+# Tests which pipeline dimensions predict DEG detection
+# across all DEG sets simultaneously, with gene AND deg_set
+# as crossed random effects to account for both gene-level
+# clustering and DEG-set-level variation
+# ============================================================
+
+cat("\nRunning combined GLMM analysis across all DEG sets...\n")
+
+if (nrow(analysis_dt) > 100 && requireNamespace("lme4", quietly=TRUE) &&
+    requireNamespace("broom.mixed", quietly=TRUE)) {
+  
+  suppressPackageStartupMessages({
+    library(lme4)
+    library(broom.mixed)
+  })
+  
+  glmm_combined_results <- list()
+  
+  # Prepare combined data — one row per kmer x pipeline combination
+  # across all DEG sets
+  glmm_dt <- analysis_dt[
+    !is.na(DEG_binary) & !is.na(ensembl_id) & !is.na(deg_name),
+    .(
+      DEG_binary       = DEG_binary,
+      ensembl_id       = ensembl_id,
+      deg_name         = deg_name,
+      grouping_type    = grouping_type,
+      fixed_value      = fixed_value,
+      aligner          = aligner,
+      fastq_trimmer    = fastq_trimmer,
+      deg_list_trimmer = if ("deg_list_trimmer" %in% names(analysis_dt))
+        deg_list_trimmer else NA_character_,
+      counter          = counter,
+      kmer_entropy     = if ("kmer_entropy" %in% names(analysis_dt))
+        kmer_entropy else NA_real_,
+      gc_content       = if ("gc_content" %in% names(analysis_dt))
+        gc_content else NA_real_
+    )
+  ]
+  
+  # Factor conversions
+  glmm_dt[, gene_f         := as.factor(ensembl_id)]
+  glmm_dt[, deg_set_f      := as.factor(deg_name)]
+  glmm_dt[, grouping_f     := as.factor(grouping_type)]
+  glmm_dt[, fixed_value_f  := as.factor(fixed_value)]
+  glmm_dt[, aligner_f      := as.factor(aligner)]
+  glmm_dt[, fastq_trim_f   := as.factor(fastq_trimmer)]
+  glmm_dt[, counter_f      := as.factor(counter)]
+  
+  has_aligner       <- uniqueN(glmm_dt$aligner_f,    na.rm=TRUE) > 1
+  has_fastq_trimmer <- uniqueN(glmm_dt$fastq_trim_f, na.rm=TRUE) > 1
+  has_counter       <- uniqueN(glmm_dt$counter_f,    na.rm=TRUE) > 1
+  has_entropy       <- sum(!is.na(glmm_dt$kmer_entropy)) > 100
+  has_gc            <- sum(!is.na(glmm_dt$gc_content))   > 100
+  
+  cat(sprintf("  Combined GLMM data: %d rows | %d genes | %d DEG sets\n",
+              nrow(glmm_dt),
+              uniqueN(glmm_dt$gene_f),
+              uniqueN(glmm_dt$deg_set_f)))
+  cat(sprintf("  Dimensions: aligner=%s | fastq_trimmer=%s | counter=%s\n",
+              has_aligner, has_fastq_trimmer, has_counter))
+  
+  # ----------------------------------------------------------
+  # Model C1: Aligner effect across all DEG sets
+  # Random: gene + deg_set (crossed)
+  # ----------------------------------------------------------
+  if (has_aligner) {
+    tryCatch({
+      fit_c1 <- glmer(
+        DEG_binary ~ aligner_f + (1 | gene_f) + (1 | deg_set_f),
+        data    = glmm_dt[!is.na(aligner_f)],
+        family  = binomial(),
+        control = glmerControl(optimizer="bobyqa", optCtrl=list(maxfun=2e5))
+      )
+      coefs <- as.data.table(tidy(fit_c1, effects="fixed"))
+      coefs[, model := "aligner_crossed_random"]
+      glmm_combined_results[["c1_aligner"]] <- coefs
+      cat(sprintf("  Combined GLMM aligner: AIC=%.1f\n", AIC(fit_c1)))
+    }, error = function(e) {
+      cat(sprintf("  [WARNING] Combined GLMM aligner failed: %s\n", e$message))
+    })
+  }
+  
+  # ----------------------------------------------------------
+  # Model C2: fastq_trimmer effect across all DEG sets
+  # ----------------------------------------------------------
+  if (has_fastq_trimmer) {
+    tryCatch({
+      fit_c2 <- glmer(
+        DEG_binary ~ fastq_trim_f + (1 | gene_f) + (1 | deg_set_f),
+        data    = glmm_dt[!is.na(fastq_trim_f)],
+        family  = binomial(),
+        control = glmerControl(optimizer="bobyqa", optCtrl=list(maxfun=2e5))
+      )
+      coefs <- as.data.table(tidy(fit_c2, effects="fixed"))
+      coefs[, model := "fastq_trimmer_crossed_random"]
+      glmm_combined_results[["c2_fastq_trimmer"]] <- coefs
+      cat(sprintf("  Combined GLMM fastq_trimmer: AIC=%.1f\n", AIC(fit_c2)))
+    }, error = function(e) {
+      cat(sprintf("  [WARNING] Combined GLMM fastq_trimmer failed: %s\n", e$message))
+    })
+  }
+  
+  # ----------------------------------------------------------
+  # Model C3: counter effect across all DEG sets
+  # ----------------------------------------------------------
+  if (has_counter) {
+    tryCatch({
+      fit_c3 <- glmer(
+        DEG_binary ~ counter_f + (1 | gene_f) + (1 | deg_set_f),
+        data    = glmm_dt[!is.na(counter_f)],
+        family  = binomial(),
+        control = glmerControl(optimizer="bobyqa", optCtrl=list(maxfun=2e5))
+      )
+      coefs <- as.data.table(tidy(fit_c3, effects="fixed"))
+      coefs[, model := "counter_crossed_random"]
+      glmm_combined_results[["c3_counter"]] <- coefs
+      cat(sprintf("  Combined GLMM counter: AIC=%.1f\n", AIC(fit_c3)))
+    }, error = function(e) {
+      cat(sprintf("  [WARNING] Combined GLMM counter failed: %s\n", e$message))
+    })
+  }
+  
+  # ----------------------------------------------------------
+  # Model C4: aligner + fastq_trimmer additive
+  # ----------------------------------------------------------
+  if (has_aligner && has_fastq_trimmer) {
+    tryCatch({
+      fit_c4 <- glmer(
+        DEG_binary ~ aligner_f + fastq_trim_f + (1 | gene_f) + (1 | deg_set_f),
+        data    = glmm_dt[!is.na(aligner_f) & !is.na(fastq_trim_f)],
+        family  = binomial(),
+        control = glmerControl(optimizer="bobyqa", optCtrl=list(maxfun=2e5))
+      )
+      coefs <- as.data.table(tidy(fit_c4, effects="fixed"))
+      coefs[, model := "aligner_plus_fastq_trimmer"]
+      glmm_combined_results[["c4_aligner_plus_trimmer"]] <- coefs
+      cat(sprintf("  Combined GLMM aligner+fastq_trimmer: AIC=%.1f\n", AIC(fit_c4)))
+    }, error = function(e) {
+      cat(sprintf("  [WARNING] Combined GLMM aligner+fastq_trimmer failed: %s\n",
+                  e$message))
+    })
+  }
+  
+  # ----------------------------------------------------------
+  # Model C5: aligner x fastq_trimmer interaction
+  # ----------------------------------------------------------
+  if (has_aligner && has_fastq_trimmer) {
+    tryCatch({
+      fit_c5 <- glmer(
+        DEG_binary ~ aligner_f * fastq_trim_f + (1 | gene_f) + (1 | deg_set_f),
+        data    = glmm_dt[!is.na(aligner_f) & !is.na(fastq_trim_f)],
+        family  = binomial(),
+        control = glmerControl(optimizer="bobyqa", optCtrl=list(maxfun=3e5))
+      )
+      coefs <- as.data.table(tidy(fit_c5, effects="fixed"))
+      coefs[, model := "aligner_x_fastq_trimmer"]
+      glmm_combined_results[["c5_aligner_x_trimmer"]] <- coefs
+      cat(sprintf("  Combined GLMM aligner x fastq_trimmer: AIC=%.1f\n",
+                  AIC(fit_c5)))
+    }, error = function(e) {
+      cat(sprintf("  [WARNING] Combined GLMM aligner x fastq_trimmer failed: %s\n",
+                  e$message))
+    })
+  }
+  
+  # ----------------------------------------------------------
+  # Model C6: grouping_type effect
+  # Does aligner-grouping vs trimmer-grouping vs counter-grouping
+  # predict DEG detection independently of which specific
+  # method was used?
+  # ----------------------------------------------------------
+  if (uniqueN(glmm_dt$grouping_f) > 1) {
+    tryCatch({
+      fit_c6 <- glmer(
+        DEG_binary ~ grouping_f + (1 | gene_f) + (1 | deg_set_f),
+        data    = glmm_dt,
+        family  = binomial(),
+        control = glmerControl(optimizer="bobyqa", optCtrl=list(maxfun=2e5))
+      )
+      coefs <- as.data.table(tidy(fit_c6, effects="fixed"))
+      coefs[, model := "grouping_type_effect"]
+      glmm_combined_results[["c6_grouping_type"]] <- coefs
+      cat(sprintf("  Combined GLMM grouping_type: AIC=%.1f\n", AIC(fit_c6)))
+    }, error = function(e) {
+      cat(sprintf("  [WARNING] Combined GLMM grouping_type failed: %s\n",
+                  e$message))
+    })
+  }
+  
+  # ----------------------------------------------------------
+  # Model C7: entropy + gc across all DEG sets
+  # ----------------------------------------------------------
+  if (has_entropy && has_gc) {
+    tryCatch({
+      dt_seq <- glmm_dt[!is.na(kmer_entropy) & !is.na(gc_content)]
+      fit_c7 <- glmer(
+        DEG_binary ~ scale(kmer_entropy) + scale(gc_content) +
+          (1 | gene_f) + (1 | deg_set_f),
+        data    = dt_seq,
+        family  = binomial(),
+        control = glmerControl(optimizer="bobyqa", optCtrl=list(maxfun=2e5))
+      )
+      coefs <- as.data.table(tidy(fit_c7, effects="fixed"))
+      coefs[, model := "entropy_gc_crossed_random"]
+      glmm_combined_results[["c7_seq_features"]] <- coefs
+      cat(sprintf("  Combined GLMM entropy+gc: AIC=%.1f\n", AIC(fit_c7)))
+    }, error = function(e) {
+      cat(sprintf("  [WARNING] Combined GLMM entropy+gc failed: %s\n", e$message))
+    })
+  }
+  
+  # ----------------------------------------------------------
+  # Model C8: Full combined model
+  # aligner + fastq_trimmer + counter + entropy + gc
+  # + aligner:entropy + fastq_trimmer:entropy
+  # Random: gene + deg_set (crossed)
+  # ----------------------------------------------------------
+  tryCatch({
+    fixed_terms <- character(0)
+    if (has_aligner)       fixed_terms <- c(fixed_terms, "aligner_f")
+    if (has_fastq_trimmer) fixed_terms <- c(fixed_terms, "fastq_trim_f")
+    if (has_counter)       fixed_terms <- c(fixed_terms, "counter_f")
+    if (has_entropy)       fixed_terms <- c(fixed_terms, "scale(kmer_entropy)")
+    if (has_gc)            fixed_terms <- c(fixed_terms, "scale(gc_content)")
+    if (has_aligner && has_entropy)
+      fixed_terms <- c(fixed_terms, "aligner_f:scale(kmer_entropy)")
+    if (has_fastq_trimmer && has_entropy)
+      fixed_terms <- c(fixed_terms, "fastq_trim_f:scale(kmer_entropy)")
+    
+    if (length(fixed_terms) >= 2) {
+      formula_str <- paste0(
+        "DEG_binary ~ ",
+        paste(fixed_terms, collapse=" + "),
+        " + (1 | gene_f) + (1 | deg_set_f)"
+      )
+      cat(sprintf("  Combined GLMM full formula: %s\n", formula_str))
+      
+      req_cols <- c("DEG_binary", "gene_f", "deg_set_f",
+                    if (has_aligner)       "aligner_f",
+                    if (has_fastq_trimmer) "fastq_trim_f",
+                    if (has_counter)       "counter_f",
+                    if (has_entropy)       "kmer_entropy",
+                    if (has_gc)            "gc_content")
+      dt_full <- glmm_dt[rowSums(is.na(.SD[, ..req_cols])) == 0]
+      
+      fit_c8 <- glmer(
+        as.formula(formula_str),
+        data    = dt_full,
+        family  = binomial(),
+        control = glmerControl(optimizer="bobyqa", optCtrl=list(maxfun=3e5))
+      )
+      coefs <- as.data.table(tidy(fit_c8, effects="fixed"))
+      coefs[, model := "full_combined_model"]
+      glmm_combined_results[["c8_full"]] <- coefs
+      cat(sprintf("  Combined GLMM full: AIC=%.1f | %d terms\n",
+                  AIC(fit_c8), nrow(coefs)))
+      
+      # Save the full model for downstream use
+      saveRDS(fit_c8,
+              file.path(output_dir, "models",
+                        paste0("glmm_full_combined_", today, ".rds")))
+    }
+  }, error = function(e) {
+    cat(sprintf("  [WARNING] Combined GLMM full model failed: %s\n", e$message))
+  })
+  
+  # ----------------------------------------------------------
+  # SAVE AND SUMMARISE COMBINED GLMM RESULTS
+  # ----------------------------------------------------------
+  if (length(glmm_combined_results) > 0) {
+    
+    glmm_combined_dt <- rbindlist(glmm_combined_results, fill=TRUE)
+    # FDR within each model
+    glmm_combined_dt[!is.na(p.value) & term != "(Intercept)",
+                     padj_within_model := p.adjust(p.value, method="BH"),
+                     by=model]
+    
+    # FDR across all models and terms globally
+    glmm_combined_dt[!is.na(p.value) & term != "(Intercept)",
+                     padj_global := p.adjust(p.value, method="BH")]
+    
+    # Bonferroni for the most conservative claim
+    glmm_combined_dt[!is.na(p.value) & term != "(Intercept)",
+                     padj_bonferroni := p.adjust(p.value, method="bonferroni")]
+    fwrite(glmm_combined_dt,
+           file.path(output_dir, "tables",
+                     paste0("glmm_combined_across_degsets_", today, ".csv")))
+    
+    # Meta-summary: which terms are significant
+    glmm_combined_summary <- glmm_combined_dt[
+      !is.na(p.value) & term != "(Intercept)", .(
+        n_models_tested  = uniqueN(model),
+        n_significant    = sum(p.value < 0.05),
+        frac_significant = mean(p.value < 0.05),
+        mean_estimate    = mean(estimate,  na.rm=TRUE),
+        sd_estimate      = sd(estimate,    na.rm=TRUE),
+        min_p            = min(p.value,    na.rm=TRUE)
+      ), by=.(model, term)]
+    setorder(glmm_combined_summary, model, min_p)
+    
+    fwrite(glmm_combined_summary,
+           file.path(output_dir, "tables",
+                     paste0("glmm_combined_summary_", today, ".csv")))
+    
+    cat("\nCombined GLMM summary — significant terms per model:\n")
+    print(glmm_combined_summary[frac_significant > 0])
+    
+    # Forest plot of combined results
+    sig_terms <- glmm_combined_dt[
+      !is.na(padj_within_model) &
+        term != "(Intercept)" &
+        padj_within_model < 0.05]   # within-model FDR
+    
+    # For headline claims use global FDR
+    robust_terms <- glmm_combined_dt[
+      !is.na(padj_global) &
+        term != "(Intercept)" &
+        padj_global < 0.05]
+    
+    if (nrow(sig_terms) > 0) {
+      sig_terms[, neg_log10p  := -log10(p.value + 1e-300)]
+      sig_terms[, significant := p.value < 0.05]
+      
+      p_combined_forest <- ggplot(
+        sig_terms,
+        aes(x      = estimate,
+            xmin   = estimate - 1.96 * std.error,
+            xmax   = estimate + 1.96 * std.error,
+            y      = term,
+            colour = significant)) +
+        geom_pointrange(size=0.4) +
+        geom_vline(xintercept=0, linetype="dashed") +
+        facet_wrap(~ model, scales="free_x") +
+        scale_colour_manual(
+          values = c("FALSE"="grey60", "TRUE"="steelblue"),
+          labels = c("n.s.", "p<0.05")) +
+        theme_classic() +
+        theme(axis.text.y  = element_text(size=7),
+              strip.text   = element_text(size=7)) +
+        labs(title  = "Combined GLMM — pipeline dimension effects across all DEG sets",
+             x      = "Effect size (log-odds) ± 95% CI",
+             y      = "Term",
+             colour = "Significant")
+      ggsave(
+        file.path(output_dir, "figures",
+                  paste0("glmm_combined_forest_", today, ".pdf")),
+        p_combined_forest,
+        width  = 16,
+        height = max(8, uniqueN(sig_terms$term) * 0.35)
+      )
+      
+      # Variance partitioning plot — relative effect sizes by dimension
+      dim_summary <- sig_terms[, .(
+        mean_abs_effect = mean(abs(estimate), na.rm=TRUE),
+        n_terms         = .N,
+        n_sig           = sum(p.value < 0.05)
+      ), by=model]
+      
+      p_variance <- ggplot(dim_summary,
+                           aes(x=model, y=mean_abs_effect, fill=model)) +
+        geom_col() +
+        theme_classic() +
+        theme(axis.text.x=element_text(angle=45, hjust=1),
+              legend.position="none") +
+        labs(title="Mean absolute effect size by pipeline dimension model",
+             x="Model", y="Mean |effect size| (log-odds)")
+      ggsave(
+        file.path(output_dir, "figures",
+                  paste0("glmm_combined_variance_partition_", today, ".pdf")),
+        p_variance, width=10, height=6
+      )
+    }
+    
+    # Compare per-DEG-set vs combined: are effects consistent?
+    glmm_consistency <- merge(
+      glmm_per_deg_dt[term != "(Intercept)", .(
+        per_deg_mean_estimate = mean(estimate,       na.rm=TRUE),
+        per_deg_sd_estimate   = sd(estimate,         na.rm=TRUE),
+        per_deg_frac_sig      = mean(p.value < 0.05, na.rm=TRUE),
+        per_deg_frac_sig_adj  = mean(padj_within_model < 0.05, na.rm=TRUE),
+        n_deg_sets            = uniqueN(deg_set)
+      ), by=.(model, term)],
+      glmm_combined_dt[term != "(Intercept)", .(
+        combined_estimate   = mean(estimate,        na.rm=TRUE),
+        combined_p          = min(p.value,          na.rm=TRUE),
+        combined_padj       = min(padj_within_model, na.rm=TRUE),
+        combined_padj_global = min(padj_global,     na.rm=TRUE),
+        combined_bonferroni = min(padj_bonferroni,  na.rm=TRUE)
+      ), by=.(model, term)],
+      by  = c("model", "term"),
+      all = TRUE
+    )
+    
+    # Flag terms consistent across per-DEG and combined analyses
+    # Requires: sig in majority of DEG sets (raw) AND survives combined FDR
+    glmm_consistency[, consistent_sig := per_deg_frac_sig > 0.5 &
+                       combined_padj < 0.05]
+    
+    # Stricter: sig in majority of DEG sets (corrected) AND survives global FDR
+    glmm_consistency[, consistent_sig_strict := per_deg_frac_sig_adj > 0.5 &
+                       combined_padj_global < 0.05]
+    
+    # Direction consistency: do per-DEG and combined estimates agree in sign?
+    glmm_consistency[, direction_consistent := sign(per_deg_mean_estimate) ==
+                       sign(combined_estimate)]
+    
+    # Composite consistency score
+    glmm_consistency[, consistency_score :=
+                       per_deg_frac_sig *                          # how often sig per DEG set
+                       as.integer(direction_consistent) *          # same direction
+                       (-log10(combined_padj + 1e-300) /           # strength in combined
+                          max(-log10(combined_padj + 1e-300), na.rm=TRUE))]
+    
+    setorder(glmm_consistency, -consistency_score)
+    
+    fwrite(glmm_consistency,
+           file.path(output_dir, "tables",
+                     paste0("glmm_consistency_perDEG_vs_combined_", today, ".csv")))
+    
+    cat("\nGLMM consistency — top terms (consistent_sig == TRUE):\n")
+    print(glmm_consistency[consistent_sig == TRUE,
+                           .(model, term, per_deg_frac_sig, combined_padj,
+                             combined_padj_global, direction_consistent,
+                             consistency_score)])
+    
+    cat(sprintf("\n  Consistent terms (lenient) : %d\n",
+                sum(glmm_consistency$consistent_sig,        na.rm=TRUE)))
+    cat(sprintf("  Consistent terms (strict)  : %d\n",
+                sum(glmm_consistency$consistent_sig_strict, na.rm=TRUE)))
+    
+  } else {
+    cat("[INFO] No combined GLMM models converged\n")
+  }
+  
+} else {
+  cat("[INFO] Skipping combined GLMM — insufficient data or missing packages\n")
+}
 
 # ============================================================
 # COMBINE MOTIF RESULTS
@@ -1659,29 +2453,110 @@ fwrite(consensus,
 # 11. BUILD FULL GENE x PIPELINE COMBINATION MATRIX
 # ============================================================
 
-all_genes    <- unique(analysis_dt$ensembl_id)
-all_aligners <- unique(analysis_dt$aligner)
-all_trimrs   <- unique(analysis_dt$fastq_trimmer)
-all_counters <- unique(analysis_dt$counter)
+# Verify required columns exist
+required_cols <- c("ensembl_id", "aligner", "counter", "grouping_type",
+                   "fixed_value", "DEG_binary")
+missing_cols  <- setdiff(required_cols, names(analysis_dt))
+if (length(missing_cols) > 0) {
+  cat(sprintf("[WARNING] Missing columns in analysis_dt: %s\n",
+              paste(missing_cols, collapse=", ")))
+}
 
-full_dt <- unique(analysis_dt[, .(ensembl_id, aligner, fastq_trimmer, counter,
-                                  grouping_type, fixed_value, DEG_binary)])
-full_dt[, DEG_binary := 0L]
-full_dt[analysis_dt,
-        on=.(ensembl_id, aligner, trimmer=fastq_trimmer, counter),
-        DEG_binary := 1L]
+# Build complete combinatorial grid of all gene x pipeline dimension combos
+# analysis_dt only contains detected DEGs (DEG_binary=1) so we must build
+# the full grid first then flag detections — otherwise DEG_binary is always 1
+all_ensembl   <- unique(analysis_dt$ensembl_id[!is.na(analysis_dt$ensembl_id)])
+all_aligners  <- unique(analysis_dt$aligner[!is.na(analysis_dt$aligner)])
+all_trimmers  <- unique(analysis_dt$fastq_trimmer[!is.na(analysis_dt$fastq_trimmer)])
+all_counters  <- unique(analysis_dt$counter[!is.na(analysis_dt$counter)])
+all_fixed     <- unique(analysis_dt$fixed_value[!is.na(analysis_dt$fixed_value)])
+all_groupings <- unique(analysis_dt$grouping_type[!is.na(analysis_dt$grouping_type)])
 
+cat(sprintf("  Grid dimensions:\n"))
+cat(sprintf("    ensembl_id    : %d unique genes\n",    length(all_ensembl)))
+cat(sprintf("    aligner       : %d (%s)\n",
+            length(all_aligners), paste(all_aligners, collapse=", ")))
+cat(sprintf("    fastq_trimmer : %d (%s)\n",
+            length(all_trimmers), paste(all_trimmers, collapse=", ")))
+cat(sprintf("    counter       : %d (%s)\n",
+            length(all_counters), paste(all_counters, collapse=", ")))
+cat(sprintf("    fixed_value   : %d (%s)\n",
+            length(all_fixed), paste(all_fixed, collapse=", ")))
+
+# Build full combinatorial grid
+full_grid <- CJ(
+  ensembl_id    = all_ensembl,
+  aligner       = all_aligners,
+  fastq_trimmer = all_trimmers,
+  counter       = all_counters
+)
+
+# Flag which gene x pipeline combinations were detected as DEGs
+# Use all dimension columns present in analysis_dt for the join
+join_cols <- intersect(
+  c("ensembl_id", "aligner", "fastq_trimmer", "counter"),
+  names(analysis_dt)
+)
+detected <- unique(analysis_dt[!is.na(ensembl_id), ..join_cols])
+detected[, DEG_binary := 1L]
+
+full_dt <- merge(full_grid, detected,
+                 by = join_cols,
+                 all.x = TRUE)
+full_dt[is.na(DEG_binary), DEG_binary := 0L]
+
+# Add grouping_type and fixed_value back via analysis_dt
+# These vary by DEG set so take the most common value per aligner x trimmer x counter
+grouping_map <- analysis_dt[, .(
+  grouping_type = grouping_type[1],
+  fixed_value   = fixed_value[1]
+), by=.(aligner, fastq_trimmer, counter)]
+grouping_map <- unique(grouping_map)
+
+full_dt <- merge(full_dt, grouping_map,
+                 by  = intersect(c("aligner", "fastq_trimmer", "counter"),
+                                 names(full_dt)),
+                 all.x = TRUE)
+
+cat(sprintf("  full_dt: %d rows | %d genes\n",
+            nrow(full_dt), uniqueN(full_dt$ensembl_id)))
+cat(sprintf("  DEG_binary=1: %d (%.1f%%) | DEG_binary=0: %d (%.1f%%)\n",
+            sum(full_dt$DEG_binary == 1L),
+            100 * mean(full_dt$DEG_binary == 1L),
+            sum(full_dt$DEG_binary == 0L),
+            100 * mean(full_dt$DEG_binary == 0L)))
+
+# Sanity check — every detected DEG should appear in full_dt as DEG_binary=1
+n_detected   <- nrow(detected)
+n_in_full    <- sum(full_dt$DEG_binary == 1L)
+if (n_detected != n_in_full) {
+  cat(sprintf("  [WARNING] Detected=%d but DEG_binary=1 rows=%d — check join cols\n",
+              n_detected, n_in_full))
+} else {
+  cat(sprintf("  [OK] All %d detected DEG combinations flagged correctly\n",
+              n_detected))
+}
+
+# Merge in sequence feature columns — averaged per gene across kmers
 gene_feature_cols <- intersect(
-  c("ensembl_id","gc_content","kmer_entropy","length","has_exon_overlap"),
-  names(analysis_dt))
-gene_meta <- analysis_dt[, lapply(.SD, function(x) {
-  if (is.numeric(x)) mean(x, na.rm=TRUE) else x[1]
-}), .SDcols=setdiff(gene_feature_cols, "ensembl_id"), by=ensembl_id]
-full_dt <- merge(full_dt, gene_meta, by="ensembl_id", all.x=TRUE)
+  c("ensembl_id", "gc_content", "kmer_entropy", "length",
+    "has_exon_overlap", "gene_symbol"),
+  names(analysis_dt)
+)
+if (length(gene_feature_cols) > 1) {
+  gene_features <- analysis_dt[, lapply(.SD, function(x) {
+    if (is.numeric(x)) mean(x, na.rm=TRUE) else x[!is.na(x)][1]
+  }), by=ensembl_id, .SDcols=setdiff(gene_feature_cols, "ensembl_id")]
+  
+  full_dt <- merge(full_dt, gene_features, by="ensembl_id", all.x=TRUE)
+  cat(sprintf("  Merged %d feature columns into full_dt\n",
+              length(gene_feature_cols) - 1))
+}
 
-cat("Full gene x pipeline matrix:", nrow(full_dt), "rows |",
-    "DEG_binary=1:", sum(full_dt$DEG_binary),
-    sprintf("(%.1f%%)\n", 100*mean(full_dt$DEG_binary)))
+cat(sprintf("Full gene x pipeline matrix: %d rows | DEG_binary=1: %d (%.1f%%)\n",
+            nrow(full_dt),
+            sum(full_dt$DEG_binary),
+            100 * mean(full_dt$DEG_binary)))
 
 # ============================================================
 # 12. KMER GLOBAL STABILITY
@@ -1805,188 +2680,734 @@ dev.off()
 # 14. BAYESIAN HIERARCHICAL MODEL
 # ============================================================
 
-has_aligner <- "aligner"      %in% names(full_dt) && uniqueN(full_dt$aligner)      > 1
-has_trimmer <- "fastq_trimmer" %in% names(full_dt) && uniqueN(full_dt$fastq_trimmer) > 1
-has_counter <- "counter"      %in% names(full_dt) && uniqueN(full_dt$counter)      > 1
+# Initialise all brms objects as NULL in global scope
+# so downstream sections 15-23 can safely check !is.null()
+formula_full     <- NULL
+formula_additive <- NULL
+brms_data        <- NULL
+fit_full         <- NULL
+loo_full         <- NULL
 
-formula_full <- bf(
-  DEG_binary ~
-    kmer_entropy + gc_content + length +
-    (if (has_aligner) "aligner" else NULL) +
-    (if (has_trimmer) "fastq_trimmer" else NULL) +
-    (if (has_counter) "counter" else NULL) +
-    (1 | ensembl_id),
-  family = bernoulli()
-)
-
-fit_full <- brm(formula_full, data=full_dt,
-                chains=4, cores=n_cores, iter=4000, backend="cmdstanr")
-saveRDS(fit_full, file.path(output_dir, "models/full_model.rds"))
+if (!requireNamespace("brms", quietly=TRUE)) {
+  cat("[SKIP] brms not available — skipping Bayesian hierarchical model\n")
+} else {
+  
+  suppressPackageStartupMessages(library(brms))
+  # Force cmdstanr backend and prevent rstan from loading
+  options(brms.backend = "cmdstanr")
+  cat(sprintf("  brms backend: %s\n", getOption("brms.backend")))
+  
+  # Determine which pipeline dimensions have variance to model
+  has_aligner  <- "aligner"       %in% names(full_dt) &
+    uniqueN(full_dt$aligner[!is.na(full_dt$aligner)])            > 1
+  has_trimmer  <- "fastq_trimmer" %in% names(full_dt) &
+    uniqueN(full_dt$fastq_trimmer[!is.na(full_dt$fastq_trimmer)]) > 1
+  has_counter  <- "counter"       %in% names(full_dt) &
+    uniqueN(full_dt$counter[!is.na(full_dt$counter)])            > 1
+  has_entropy  <- "kmer_entropy"  %in% names(full_dt) &
+    sum(!is.na(full_dt$kmer_entropy) &
+          is.finite(full_dt$kmer_entropy)) > 100
+  has_gc       <- "gc_content"    %in% names(full_dt) &
+    sum(!is.na(full_dt$gc_content) &
+          is.finite(full_dt$gc_content))   > 100
+  has_length   <- "length"        %in% names(full_dt) &
+    sum(!is.na(full_dt$length) &
+          is.finite(full_dt$length))       > 100
+  
+  cat("  Bayesian model dimensions:\n")
+  cat(sprintf("    aligner      : %s (n=%d)\n", has_aligner,
+              if (has_aligner) uniqueN(full_dt$aligner,       na.rm=TRUE) else 0))
+  cat(sprintf("    fastq_trimmer: %s (n=%d)\n", has_trimmer,
+              if (has_trimmer) uniqueN(full_dt$fastq_trimmer, na.rm=TRUE) else 0))
+  cat(sprintf("    counter      : %s (n=%d)\n", has_counter,
+              if (has_counter) uniqueN(full_dt$counter,       na.rm=TRUE) else 0))
+  cat(sprintf("    kmer_entropy : %s\n", has_entropy))
+  cat(sprintf("    gc_content   : %s\n", has_gc))
+  cat(sprintf("    length       : %s\n", has_length))
+  
+  # Verify sufficient variance in outcome
+  deg_frac <- mean(full_dt$DEG_binary, na.rm=TRUE)
+  cat(sprintf("  DEG_binary: %d zeros | %d ones (%.1f%% positive)\n",
+              sum(full_dt$DEG_binary == 0L, na.rm=TRUE),
+              sum(full_dt$DEG_binary == 1L, na.rm=TRUE),
+              100 * deg_frac))
+  
+  if (deg_frac == 0 || deg_frac == 1) {
+    cat(sprintf("[SKIP] Bayesian model — no variance in DEG_binary (fraction=%.3f)\n",
+                deg_frac))
+  } else {
+    
+    # Build model columns list
+    model_cols <- unique(c(
+      "DEG_binary", "ensembl_id",
+      if (has_entropy) "kmer_entropy",
+      if (has_gc)      "gc_content",
+      if (has_length)  "length",
+      if (has_aligner) "aligner",
+      if (has_trimmer) "fastq_trimmer",
+      if (has_counter) "counter"
+    ))
+    model_cols <- intersect(model_cols, names(full_dt))
+    
+    # Convert to data.frame and clean
+    brms_data <- as.data.frame(full_dt[, ..model_cols])
+    
+    # Factor conversions
+    if (has_aligner) brms_data$aligner       <- as.factor(brms_data$aligner)
+    if (has_trimmer) brms_data$fastq_trimmer  <- as.factor(brms_data$fastq_trimmer)
+    if (has_counter) brms_data$counter        <- as.factor(brms_data$counter)
+    brms_data$ensembl_id <- as.factor(brms_data$ensembl_id)
+    
+    # Replace Inf/-Inf with NA in numeric columns
+    num_cols <- model_cols[sapply(brms_data[model_cols], is.numeric)]
+    for (col in num_cols) {
+      n_inf <- sum(!is.finite(brms_data[[col]]), na.rm=TRUE)
+      if (n_inf > 0) {
+        cat(sprintf("    %s: %d non-finite values replaced with NA\n", col, n_inf))
+        brms_data[[col]][!is.finite(brms_data[[col]])] <- NA
+      }
+    }
+    
+    # Report NAs per column before filtering
+    cat("  NAs per column before filtering:\n")
+    for (col in model_cols) {
+      n_na <- sum(is.na(brms_data[[col]]))
+      if (n_na > 0) cat(sprintf("    %s: %d NAs\n", col, n_na))
+    }
+    
+    # Remove incomplete rows
+    brms_data <- brms_data[complete.cases(brms_data), ]
+    
+    # Check for zero-variance numeric columns after cleaning
+    zero_var_cols <- num_cols[sapply(num_cols, function(col) {
+      v <- var(brms_data[[col]], na.rm=TRUE)
+      is.na(v) || v == 0
+    })]
+    if (length(zero_var_cols) > 0) {
+      cat(sprintf("  [WARNING] Zero-variance columns: %s — excluded from model\n",
+                  paste(zero_var_cols, collapse=", ")))
+      if ("kmer_entropy" %in% zero_var_cols) has_entropy <- FALSE
+      if ("gc_content"   %in% zero_var_cols) has_gc      <- FALSE
+      if ("length"       %in% zero_var_cols) has_length  <- FALSE
+    }
+    
+    cat(sprintf("  brms data after cleaning: %d rows | DEG_binary=1: %d (%.1f%%)\n",
+                nrow(brms_data),
+                sum(brms_data$DEG_binary),
+                100 * mean(brms_data$DEG_binary)))
+    cat(sprintf("  aligner levels      : %s\n",
+                if (has_aligner) paste(levels(brms_data$aligner),       collapse=", ") else "N/A"))
+    cat(sprintf("  fastq_trimmer levels: %s\n",
+                if (has_trimmer) paste(levels(brms_data$fastq_trimmer), collapse=", ") else "N/A"))
+    cat(sprintf("  counter levels      : %s\n",
+                if (has_counter) paste(levels(brms_data$counter),       collapse=", ") else "N/A"))
+    if (has_entropy) cat(sprintf("  kmer_entropy range  : %.3f to %.3f\n",
+                                 min(brms_data$kmer_entropy),
+                                 max(brms_data$kmer_entropy)))
+    if (has_gc)      cat(sprintf("  gc_content range    : %.3f to %.3f\n",
+                                 min(brms_data$gc_content),
+                                 max(brms_data$gc_content)))
+    
+    # Build fixed effects terms
+    fixed_terms <- character(0)
+    if (has_entropy) fixed_terms <- c(fixed_terms, "scale(kmer_entropy)")
+    if (has_gc)      fixed_terms <- c(fixed_terms, "scale(gc_content)")
+    if (has_length)  fixed_terms <- c(fixed_terms, "scale(length)")
+    if (has_aligner) fixed_terms <- c(fixed_terms, "aligner")
+    if (has_trimmer) fixed_terms <- c(fixed_terms, "fastq_trimmer")
+    if (has_counter) fixed_terms <- c(fixed_terms, "counter")
+    
+    # Interaction terms
+    if (has_aligner && has_trimmer)
+      fixed_terms <- c(fixed_terms, "aligner:fastq_trimmer")
+    if (has_aligner && has_entropy)
+      fixed_terms <- c(fixed_terms, "aligner:scale(kmer_entropy)")
+    if (has_trimmer && has_entropy)
+      fixed_terms <- c(fixed_terms, "fastq_trimmer:scale(kmer_entropy)")
+    
+    # Additive-only terms for fallback
+    additive_terms <- fixed_terms[!grepl(":", fixed_terms)]
+    
+    formula_full     <- paste0("DEG_binary ~ ",
+                               paste(fixed_terms,     collapse=" + "),
+                               " + (1 | ensembl_id)")
+    formula_additive <- paste0("DEG_binary ~ ",
+                               paste(additive_terms, collapse=" + "),
+                               " + (1 | ensembl_id)")
+    
+    cat(sprintf("  Full formula     : %s\n", formula_full))
+    cat(sprintf("  Additive formula : %s\n", formula_additive))
+    
+    # Weakly informative priors
+    priors <- c(
+      prior(normal(0, 2),   class="Intercept"),
+      prior(normal(0, 1),   class="b"),
+      prior(exponential(1), class="sd")
+    )
+    
+    dir.create(file.path(output_dir, "models"), showWarnings=FALSE)
+    
+    brms_backend <- if (requireNamespace("cmdstanr", quietly=TRUE)) "cmdstanr" else "rstan"
+    fit_full     <- NULL
+    
+    # --- Attempt 1: Full model with interactions ---
+    cat("  Fitting full Bayesian model (with interactions)...\n")
+    tryCatch({
+      fit_full <- brm(
+        formula = as.formula(formula_full),
+        data    = brms_data,
+        family  = bernoulli(),
+        prior   = priors,
+        chains  = 4,
+        cores   = min(4L, n_cores),
+        iter    = 4000,
+        warmup  = 1000,
+        seed    = 42,
+        backend = brms_backend,
+        file    = file.path(output_dir, "models",
+                            paste0("brms_full_", today))
+      )
+      cat("  Full model fitted successfully\n")
+    }, error = function(e) {
+      cat(sprintf("  [WARNING] Full model failed: %s\n", e$message))
+    })
+    
+    # --- Attempt 2: Additive fallback ---
+    if (is.null(fit_full)) {
+      cat("  Fitting additive fallback model (no interactions)...\n")
+      tryCatch({
+        fit_full <<- brm(
+          formula = as.formula(formula_additive),
+          data    = brms_data,
+          family  = bernoulli(),
+          prior   = priors,
+          chains  = 4,
+          cores   = min(4L, n_cores),
+          iter    = 4000,
+          warmup  = 1000,
+          seed    = 42,
+          backend = brms_backend,
+          file    = file.path(output_dir, "models",
+                              paste0("brms_additive_", today))
+        )
+        cat("  Additive model fitted successfully\n")
+      }, error = function(e) {
+        cat(sprintf("  [ERROR] Additive model also failed: %s\n", e$message))
+      })
+    }
+    
+    # --- Attempt 3: Minimal model — sequence features only ---
+    if (is.null(fit_full) && (has_entropy || has_gc)) {
+      cat("  Fitting minimal fallback model (sequence features only)...\n")
+      minimal_terms   <- additive_terms[!grepl("aligner|fastq_trimmer|counter",
+                                               additive_terms)]
+      formula_minimal <- paste0("DEG_binary ~ ",
+                                paste(minimal_terms, collapse=" + "),
+                                " + (1 | ensembl_id)")
+      cat(sprintf("  Minimal formula: %s\n", formula_minimal))
+      tryCatch({
+        fit_full <<- brm(
+          formula = as.formula(formula_minimal),
+          data    = brms_data,
+          family  = bernoulli(),
+          prior   = priors,
+          chains  = 4,
+          cores   = min(4L, n_cores),
+          iter    = 4000,
+          warmup  = 1000,
+          seed    = 42,
+          backend = brms_backend,
+          file    = file.path(output_dir, "models",
+                              paste0("brms_minimal_", today))
+        )
+        cat("  Minimal model fitted successfully\n")
+      }, error = function(e) {
+        cat(sprintf("  [ERROR] Minimal model also failed: %s\n", e$message))
+      })
+    }
+    
+    # --- Post-fit outputs ---
+    if (!is.null(fit_full)) {
+      
+      saveRDS(fit_full,
+              file.path(output_dir, "models",
+                        paste0("brms_full_", today, ".rds")))
+      
+      cat("\n  Bayesian model summary:\n")
+      tryCatch({
+        cat("\n  Bayesian model summary:\n")
+        suppressPackageStartupMessages(library(posterior))
+        draws <- as_draws_df(fit_full)
+        summ  <- summarise_draws(draws,
+                                 mean, sd,
+                                 ~quantile(.x, probs=c(0.025, 0.975)),
+                                 ~rhat(.x),
+                                 ~ess_bulk(.x))
+        print(summ[grepl("^b_", summ$variable), ])
+      }, error = function(e) {
+        cat(sprintf("  [WARNING] Summary failed: %s\n", e$message))
+      })
+      
+      # Extract posterior estimates
+      brms_coefs <- as.data.table(
+        fixef(fit_full, summary=TRUE), keep.rownames="term")
+      
+      # Rename — guard against version differences in brms column names
+      expected_names <- c("Estimate", "Est.Error", "Q2.5", "Q97.5")
+      actual_names   <- names(brms_coefs)[names(brms_coefs) != "term"]
+      cat(sprintf("  fixef columns: %s\n", paste(actual_names, collapse=", ")))
+      
+      if (all(expected_names %in% names(brms_coefs))) {
+        setnames(brms_coefs,
+                 c("Estimate", "Est.Error", "Q2.5", "Q97.5"),
+                 c("estimate", "std_error", "ci_lower", "ci_upper"))
+      } else {
+        # Fallback — rename positionally
+        setnames(brms_coefs,
+                 actual_names,
+                 c("estimate", "std_error", "ci_lower", "ci_upper")[seq_along(actual_names)])
+      }
+      
+      brms_coefs[, significant  := sign(ci_lower) == sign(ci_upper)]
+      brms_coefs[, model        := "brms"]
+      brms_coefs[, abs_estimate := abs(estimate)]
+      setorder(brms_coefs, -abs_estimate)
+      brms_coefs[, abs_estimate := NULL]
+      
+      fwrite(brms_coefs,
+             file.path(output_dir, "tables",
+                       paste0("brms_coefficients_", today, ".csv")))
+      
+      cat(sprintf("\n  Significant terms (95%% CI excludes 0): %d\n",
+                  sum(brms_coefs$significant, na.rm=TRUE)))
+      print(brms_coefs[significant == TRUE,
+                       .(term, estimate, ci_lower, ci_upper)])
+      
+      # Forest plot
+      p_brms <- ggplot(
+        brms_coefs[term != "Intercept"],
+        aes(x      = estimate,
+            xmin   = ci_lower,
+            xmax   = ci_upper,
+            y      = reorder(term, estimate),
+            colour = significant)) +
+        geom_pointrange() +
+        geom_vline(xintercept=0, linetype="dashed") +
+        scale_colour_manual(
+          values = c("FALSE"="grey60", "TRUE"="steelblue"),
+          labels = c("CI includes 0", "CI excludes 0")) +
+        theme_classic() +
+        theme(axis.text.y=element_text(size=8)) +
+        labs(title  = "Bayesian hierarchical model — pipeline dimension effects",
+             x      = "Posterior estimate (log-odds) ± 95% CI",
+             y      = "Term",
+             colour = "Significant")
+      ggsave(file.path(output_dir, "figures",
+                       paste0("brms_forest_plot_", today, ".pdf")),
+             p_brms, width=12,
+             height=max(6, nrow(brms_coefs[term != "Intercept"]) * 0.4))
+      
+      # Conditional effects
+      tryCatch({
+        ce_plots <- conditional_effects(fit_full)
+        pdf(file.path(output_dir, "figures",
+                      paste0("brms_conditional_effects_", today, ".pdf")),
+            width=10, height=6)
+        for (ce_name in names(ce_plots)) {
+          print(plot(ce_plots, plot=FALSE)[[ce_name]] +
+                  theme_classic() +
+                  labs(title=paste("Conditional effect:", ce_name)))
+        }
+        dev.off()
+      }, error = function(e) {
+        cat(sprintf("  [WARNING] Conditional effects failed: %s\n", e$message))
+        if (dev.cur() > 1) dev.off()
+      })
+      
+      # LOO cross-validation
+      tryCatch({
+        loo_full <- loo(fit_full)
+        cat("\n  LOO cross-validation:\n")
+        print(loo_full)
+        saveRDS(loo_full,
+                file.path(output_dir, "models",
+                          paste0("brms_loo_", today, ".rds")))
+      }, error = function(e) {
+        cat(sprintf("  [WARNING] LOO failed: %s\n", e$message))
+      })
+      
+    } else {
+      cat("[SKIP] All Bayesian model attempts failed — check data diagnostics above\n")
+    }
+  }
+}
 
 # ============================================================
 # 15. MODEL COMPARISON (LOO / WAIC)
 # ============================================================
 
-loo_full  <- loo(fit_full)
-waic_full <- waic(fit_full)
-saveRDS(loo_full,  file.path(output_dir, "models/loo_full.rds"))
-saveRDS(waic_full, file.path(output_dir, "models/waic_full.rds"))
+if (exists("fit_full") && !is.null(fit_full)) {
+  tryCatch({
+    waic_full <- waic(fit_full)
+    saveRDS(waic_full, file.path(output_dir, "models",
+                                 paste0("waic_full_", today, ".rds")))
+  }, error = function(e) cat(sprintf("[WARNING] WAIC failed: %s\n", e$message)))
+} else {
+  cat("[SKIP] Section 15 — fit_full not available\n")
+}
 
 # ============================================================
 # 16. K-FOLD CROSS-VALIDATION
 # ============================================================
 
-kfold_res <- kfold(fit_full, K=10)
-saveRDS(kfold_res, file.path(output_dir, "models/kfold.rds"))
+if (exists("fit_full") && !is.null(fit_full)) {
+  tryCatch({
+    kfold_res <- kfold(fit_full, K=5)   # K=5 more practical
+    saveRDS(kfold_res, file.path(output_dir, "models",
+                                 paste0("kfold_", today, ".rds")))
+  }, error = function(e) cat(sprintf("[WARNING] K-fold failed: %s\n", e$message)))
+} else {
+  cat("[SKIP] Section 16 — fit_full not available\n")
+}
 
 # ============================================================
 # 17. LEAVE-ONE-ALIGNER-OUT VALIDATION
 # ============================================================
 
-unique_aligners <- unique(full_dt$aligner)
-loo_align <- future_lapply(unique_aligners, function(a) {
-  brm(formula_full, data=full_dt[aligner != a],
-      chains=2, cores=2, iter=2000, backend="cmdstanr")
-})
-names(loo_align) <- unique_aligners
-saveRDS(loo_align, file.path(output_dir, "models/leave_one_aligner_out.rds"))
+if (exists("fit_full") && !is.null(fit_full) && exists("formula_full")) {
+  unique_aligners <- unique(full_dt$aligner[!is.na(full_dt$aligner)])
+  brms_backend    <- if (requireNamespace("cmdstanr", quietly=TRUE))
+    "cmdstanr" else "rstan"
+  loo_align <- lapply(unique_aligners, function(a) {
+    tryCatch({
+      brm(as.formula(formula_full),
+          data    = brms_data[brms_data$aligner != a, ],
+          family  = bernoulli(),
+          chains  = 2,
+          cores   = min(4L, n_cores),
+          iter    = 2000,
+          seed    = 42,
+          backend = brms_backend)
+    }, error = function(e) {
+      cat(sprintf("  [WARNING] LOO aligner %s failed: %s\n", a, e$message))
+      NULL
+    })
+  })
+  names(loo_align) <- unique_aligners
+  loo_align <- loo_align[!sapply(loo_align, is.null)]
+  saveRDS(loo_align, file.path(output_dir, "models",
+                               paste0("leave_one_aligner_out_", today, ".rds")))
+} else {
+  cat("[SKIP] Section 17 — fit_full or formula_full not available\n")
+}
 
 # ============================================================
 # 18. ROC / AUC PER ALIGNER
 # ============================================================
 
-fitted_probs <- fitted(fit_full)[, 1]
-full_dt[, fitted := fitted_probs]
-
-roc_list <- lapply(unique_aligners, function(a) {
-  sub <- full_dt[aligner == a]
-  roc(sub$DEG_binary, sub$fitted)
-})
-names(roc_list) <- unique_aligners
-
-pdf(file.path(output_dir, "figures/ROC_comparison.pdf"))
-for (a in unique_aligners) plot(roc_list[[a]], main=paste("ROC —", a))
-dev.off()
+if (exists("fit_full") && !is.null(fit_full)) {
+  tryCatch({
+    suppressPackageStartupMessages(library(pROC))
+    fitted_probs <- fitted(fit_full)[, "Estimate"]  # column 1 = Estimate
+    full_dt[seq_len(nrow(brms_data)), fitted := fitted_probs]
+    
+    unique_aligners <- unique(full_dt$aligner[!is.na(full_dt$aligner)])
+    roc_list <- lapply(unique_aligners, function(a) {
+      sub <- full_dt[aligner == a & !is.na(fitted)]
+      if (nrow(sub) < 10) return(NULL)
+      roc(sub$DEG_binary, sub$fitted, quiet=TRUE)
+    })
+    names(roc_list) <- unique_aligners
+    roc_list <- roc_list[!sapply(roc_list, is.null)]
+    
+    pdf(file.path(output_dir, "figures",
+                  paste0("ROC_comparison_", today, ".pdf")),
+        width=8, height=6)
+    cols <- RColorBrewer::brewer.pal(min(8, length(roc_list)), "Set1")
+    for (i in seq_along(roc_list)) {
+      if (i == 1) plot(roc_list[[i]],  col=cols[i], main="ROC — per aligner")
+      else        lines(roc_list[[i]], col=cols[i])
+    }
+    legend("bottomright", names(roc_list), col=cols, lwd=2, cex=0.8)
+    dev.off()
+    
+    auc_dt <- data.table(
+      aligner = names(roc_list),
+      auc     = sapply(roc_list, function(r) as.numeric(auc(r)))
+    )
+    fwrite(auc_dt, file.path(output_dir, "tables",
+                             paste0("roc_auc_per_aligner_", today, ".csv")))
+    cat("  AUC per aligner:\n")
+    print(auc_dt)
+  }, error = function(e) {
+    cat(sprintf("[WARNING] ROC/AUC failed: %s\n", e$message))
+  })
+} else {
+  cat("[SKIP] Section 18 — fit_full not available\n")
+}
 
 # ============================================================
 # 19. VARIANCE DECOMPOSITION
 # ============================================================
 
-vc <- VarCorr(fit_full)
-saveRDS(vc, file.path(output_dir, "tables/variance_decomposition.rds"))
+if (exists("fit_full") && !is.null(fit_full)) {
+  tryCatch({
+    vc    <- VarCorr(fit_full)
+    vc_dt <- as.data.table(as.data.frame(vc))
+    fwrite(vc_dt, file.path(output_dir, "tables",
+                            paste0("variance_decomposition_", today, ".csv")))
+    saveRDS(vc, file.path(output_dir, "models",
+                          paste0("variance_components_", today, ".rds")))
+    cat("\n  Variance components:\n")
+    print(vc)
+  }, error = function(e) {
+    cat(sprintf("[WARNING] Variance decomposition failed: %s\n", e$message))
+  })
+} else {
+  cat("[SKIP] Section 19 — fit_full not available\n")
+}
 
 # ============================================================
 # 20. SHAP-STYLE VARIANCE ATTRIBUTION
 # ============================================================
 
-posterior_draws <- as_draws_df(fit_full)
-var_components  <- colVars(as.matrix(posterior_draws))
-fwrite(data.table(parameter=names(var_components), variance=var_components),
-       file.path(output_dir, "tables/variance_attribution.tsv"))
+if (exists("fit_full") && !is.null(fit_full)) {
+  tryCatch({
+    suppressPackageStartupMessages({
+      library(posterior)
+      library(matrixStats)
+    })
+    posterior_draws <- as_draws_df(fit_full)
+    draw_matrix     <- as.matrix(posterior_draws[, grep("^b_", names(posterior_draws))])
+    var_components  <- colVars(draw_matrix)
+    var_dt <- data.table(
+      parameter = names(var_components),
+      variance  = var_components,
+      sd        = sqrt(var_components)
+    )
+    setorder(var_dt, -variance)
+    fwrite(var_dt, file.path(output_dir, "tables",
+                             paste0("variance_attribution_", today, ".tsv")),
+           sep="\t")
+    cat("\n  Top variance components:\n")
+    print(head(var_dt, 10))
+  }, error = function(e) {
+    cat(sprintf("[WARNING] Variance attribution failed: %s\n", e$message))
+  })
+} else {
+  cat("[SKIP] Section 20 — fit_full not available\n")
+}
 
 # ============================================================
 # 21. HIERARCHICAL CLUSTERING
 # ============================================================
 
-clust_mat <- dcast(full_dt, ensembl_id ~ aligner + trimmer + counter,
-                   value.var="DEG_binary", fill=0)
-dist_mat  <- dist(as.matrix(clust_mat[, -1]))
-hc        <- hclust(dist_mat)
-
-pdf(file.path(output_dir, "figures/hierarchical_dendrogram.pdf"))
-plot(hc, labels=FALSE, main="Gene clustering by pipeline detection pattern")
-dev.off()
+if (nrow(full_dt) > 0) {
+  tryCatch({
+    # Build detection pattern matrix — one row per gene
+    # columns = aligner_fastq_trimmer_counter combinations
+    clust_cols <- intersect(c("aligner", "fastq_trimmer", "counter"),
+                            names(full_dt))
+    full_dt[, combo := do.call(paste, c(.SD, sep="_")), .SDcols=clust_cols]
+    
+    clust_mat <- dcast(full_dt, ensembl_id ~ combo,
+                       value.var="DEG_binary", fill=0)
+    clust_matrix <- as.matrix(clust_mat[, -"ensembl_id", with=FALSE])
+    rownames(clust_matrix) <- clust_mat$ensembl_id
+    
+    dist_mat <- dist(clust_matrix, method="binary")
+    hc       <- hclust(dist_mat, method="ward.D2")
+    
+    pdf(file.path(output_dir, "figures",
+                  paste0("hierarchical_dendrogram_", today, ".pdf")),
+        width=12, height=8)
+    plot(hc, labels=clust_mat$ensembl_id, cex=0.5,
+         main="Gene clustering by pipeline detection pattern")
+    dev.off()
+    
+    # Save cluster assignments
+    k         <- min(8L, nrow(clust_matrix) - 1L)
+    clusters  <- cutree(hc, k=k)
+    cluster_dt <- data.table(ensembl_id=names(clusters), cluster=clusters)
+    fwrite(cluster_dt, file.path(output_dir, "tables",
+                                 paste0("gene_clusters_", today, ".csv")))
+  }, error = function(e) {
+    cat(sprintf("[WARNING] Hierarchical clustering failed: %s\n", e$message))
+  })
+} else {
+  cat("[SKIP] Section 21 — full_dt empty\n")
+}
 
 # ============================================================
 # 22. POSTERIOR PREDICTIVE CHECKS
 # ============================================================
 
-pdf(file.path(output_dir, "diagnostics/posterior_predictive.pdf"))
-pp_check(fit_full)
-dev.off()
+if (exists("fit_full") && !is.null(fit_full)) {
+  tryCatch({
+    dir.create(file.path(output_dir, "diagnostics"), showWarnings=FALSE)
+    pdf(file.path(output_dir, "diagnostics",
+                  paste0("posterior_predictive_", today, ".pdf")),
+        width=10, height=6)
+    print(pp_check(fit_full, ndraws=100))
+    dev.off()
+  }, error = function(e) {
+    cat(sprintf("[WARNING] Posterior predictive check failed: %s\n", e$message))
+    if (dev.cur() > 1) dev.off()
+  })
+} else {
+  cat("[SKIP] Section 22 — fit_full not available\n")
+}
 
 # ============================================================
 # 23. INTERACTION VISUALIZATION
 # ============================================================
 
-pdf(file.path(output_dir, "figures/interaction_plots.pdf"))
-plot(conditional_effects(fit_full, effects="aligner:trimmer"))
-dev.off()
+if (exists("fit_full") && !is.null(fit_full)) {
+  tryCatch({
+    # Only plot interactions that are in the model
+    model_terms   <- rownames(fixef(fit_full))
+    has_interaction <- any(grepl("aligner.*fastq_trimmer|fastq_trimmer.*aligner",
+                                 model_terms))
+    if (has_interaction) {
+      pdf(file.path(output_dir, "figures",
+                    paste0("interaction_plots_", today, ".pdf")),
+          width=12, height=8)
+      print(plot(conditional_effects(
+        fit_full, effects="aligner:fastq_trimmer"), plot=FALSE)[[1]] +
+          theme_classic() +
+          labs(title="Aligner x FASTQ trimmer interaction"))
+      dev.off()
+    } else {
+      cat("[SKIP] Section 23 — no aligner:fastq_trimmer interaction in model\n")
+    }
+  }, error = function(e) {
+    cat(sprintf("[WARNING] Interaction plot failed: %s\n", e$message))
+    if (dev.cur() > 1) dev.off()
+  })
+} else {
+  cat("[SKIP] Section 23 — fit_full not available\n")
+}
 
 # ============================================================
 # 24. PDF ROBUSTNESS REPORT WITH METHOD SIMILARITY HEATMAPS
 # ============================================================
 
-pdf(file.path(output_dir,
-              paste0("Robustness_Report_with_Heatmaps_", today, ".pdf")),
-    width=14, height=10)
-
-heatmap_mat <- reshape2::acast(all_summaries_dt,
-                               method ~ deg_set, value.var="unique_genes")
-if (!is.null(heatmap_mat) && nrow(heatmap_mat) > 0) {
-  draw(Heatmap(heatmap_mat,
-               name         = "Unique Genes",
-               column_title = "Unique genes per method x DEG set",
-               col          = colorRamp2(
-                 c(min(heatmap_mat, na.rm=TRUE), max(heatmap_mat, na.rm=TRUE)),
-                 c("white","steelblue"))))
-}
-
-barplot(consensus$total_genes,
-        names.arg=consensus$method, las=2,
-        main="Total genes per method", col="steelblue")
-
-for (dn in names(all_kmer_gene_lists)) {
-  jac_mat <- compute_jaccard(all_kmer_gene_lists[[dn]])
-  if (nrow(jac_mat) > 0) {
-    draw(Heatmap(jac_mat,
-                 name         = "Jaccard",
-                 column_title = paste0("Method similarity: ", dn),
-                 col          = colorRamp2(c(0,1), c("white","darkgreen"))))
+tryCatch({
+  dir.create(file.path(output_dir, "figures"), showWarnings=FALSE)
+  pdf(file.path(output_dir,
+                paste0("Robustness_Report_with_Heatmaps_", today, ".pdf")),
+      width=14, height=10)
+  
+  if (exists("all_summaries_dt") && !is.null(all_summaries_dt) &&
+      nrow(all_summaries_dt) > 0 &&
+      all(c("method", "deg_set", "unique_genes") %in% names(all_summaries_dt))) {
+    heatmap_mat <- reshape2::acast(
+      all_summaries_dt, method ~ deg_set, value.var="unique_genes")
+    heatmap_mat[is.na(heatmap_mat)] <- 0
+    draw(Heatmap(heatmap_mat,
+                 name         = "Unique Genes",
+                 column_title = "Unique genes per method x DEG set",
+                 col          = colorRamp2(
+                   c(0, max(heatmap_mat, na.rm=TRUE)),
+                   c("white", "steelblue"))))
   }
-}
-
-dev.off()
+  
+  if (exists("consensus") && !is.null(consensus) &&
+      all(c("total_genes", "method") %in% names(consensus))) {
+    barplot(consensus$total_genes,
+            names.arg = consensus$method,
+            las=2, main="Total genes per method", col="steelblue")
+  }
+  
+  if (exists("all_kmer_gene_lists") && length(all_kmer_gene_lists) > 0) {
+    for (dn in names(all_kmer_gene_lists)) {
+      jac_mat <- compute_jaccard(all_kmer_gene_lists[[dn]])
+      if (!is.null(jac_mat) && nrow(jac_mat) > 1) {
+        draw(Heatmap(jac_mat,
+                     name         = "Jaccard",
+                     column_title = paste0("Method similarity: ", dn),
+                     col          = colorRamp2(c(0,1),
+                                               c("white","darkgreen"))))
+      }
+    }
+  }
+  
+  dev.off()
+}, error = function(e) {
+  cat(sprintf("[WARNING] Robustness report failed: %s\n", e$message))
+  if (dev.cur() > 1) dev.off()
+})
 
 # ============================================================
 # 25. ZSTD COMPRESSION
 # ============================================================
 
-compress_files <- function(path) {
-  files <- list.files(path, full.names=TRUE, recursive=FALSE)
-  future_lapply(files, function(f) system(paste("zstd -19 -f", shQuote(f))))
+compress_outputs <- function(path) {
+  files <- list.files(path, full.names=TRUE, recursive=FALSE,
+                      pattern="\\.(csv|tsv|rds)$")
+  # Skip already compressed
+  files <- files[!grepl("\\.zst$", files)]
+  cat(sprintf("  Compressing %d files in %s\n", length(files), path))
+  for (f in files) {
+    tryCatch({
+      ret <- system(paste("zstd -19 -f --rm", shQuote(f)), intern=FALSE)
+      if (ret != 0) cat(sprintf("  [WARNING] zstd failed for: %s\n", f))
+    }, error = function(e) {
+      cat(sprintf("  [WARNING] Compression error for %s: %s\n", f, e$message))
+    })
+  }
 }
-compress_files(file.path(output_dir, "tables"))
-compress_files(file.path(output_dir, "models"))
+
+compress_outputs(file.path(output_dir, "tables"))
+compress_outputs(file.path(output_dir, "models"))
 
 # ============================================================
-# DONE
+# 26. CLEAN SHUTDOWN
 # ============================================================
+cat("Shutting down parallel workers...\n")
+tryCatch({
+  future::plan(sequential)
+  gc()
+}, error = function(e) {
+  cat(sprintf("[INFO] Parallel shutdown (non-critical): %s\n", e$message))
+})
 
 cat("\n============================================================\n")
 cat("Pipeline completed successfully.\n")
+cat(sprintf("Completed: %s\n", format(Sys.time(), "%Y-%m-%d %H:%M:%S")))
+cat("============================================================\n")
 cat("Key outputs:\n")
-cat("  Finalized biomarkers            :",
-    file.path(output_dir, "tables", paste0("FINALIZED_BIOMARKERS_",               today, ".tsv")), "\n")
-cat("  All DEG tables combined         :",
-    file.path(output_dir, "tables", paste0("all_deg_tables_combined_",            today, ".csv")), "\n")
-cat("  Gene cross-DEG reproducibility  :",
-    file.path(output_dir, "tables", paste0("gene_cross_deg_reproducibility_",     today, ".csv")), "\n")
-cat("  Cross-DEG per aligner           :",
-    file.path(output_dir, "tables", paste0("gene_cross_deg_per_aligner_",         today, ".csv")), "\n")
-cat("  Cross-DEG per counter           :",
-    file.path(output_dir, "tables", paste0("gene_cross_deg_per_counter_",         today, ".csv")), "\n")
-cat("  Cross-DEG per trimmer           :",
-    file.path(output_dir, "tables", paste0("gene_cross_deg_per_trimmer_",         today, ".csv")), "\n")
-cat("  Kmer global stability           :",
-    file.path(output_dir, "tables", paste0("kmer_global_stability_",              today, ".tsv")), "\n")
-cat("  Gene kmer stability             :",
-    file.path(output_dir, "tables", paste0("gene_kmer_stability_",                today, ".tsv")), "\n")
-cat("  Motif enrichment (all DEG sets) :",
-    file.path(output_dir, "tables", paste0("motif_enrichment_all_degsets_",       today, ".csv")), "\n")
-cat("  Sub-kmer enrichment (all DEG)   :",
-    file.path(output_dir, "tables", paste0("subkmer_enrichment_all_degsets_",     today, ".csv")), "\n")
-cat("  Global fastq sensitivity        :",
-    file.path(output_dir, "tables", paste0("global_fastq_sensitivity_summary_",   today, ".csv")), "\n")
-cat("  Robustness ranking              :",
-    file.path(output_dir, "diagnostics", paste0("ROBUSTNESS_RANKING_",            today, ".csv")), "\n")
+cat(sprintf("  Finalized biomarkers            : %s\n",
+            file.path(output_dir, "tables", paste0("FINALIZED_BIOMARKERS_",         today, ".tsv"))))
+cat(sprintf("  All DEG tables combined         : %s\n",
+            file.path(output_dir, "tables", paste0("all_deg_tables_combined_",      today, ".csv"))))
+cat(sprintf("  Gene cross-DEG reproducibility  : %s\n",
+            file.path(output_dir, "tables", paste0("gene_cross_deg_reproducibility_",today, ".csv"))))
+cat(sprintf("  Cross-DEG per aligner           : %s\n",
+            file.path(output_dir, "tables", paste0("gene_cross_deg_per_aligner_",   today, ".csv"))))
+cat(sprintf("  Cross-DEG per counter           : %s\n",
+            file.path(output_dir, "tables", paste0("gene_cross_deg_per_counter_",   today, ".csv"))))
+cat(sprintf("  Cross-DEG per fixed value       : %s\n",
+            file.path(output_dir, "tables", paste0("gene_cross_deg_per_fixed_value_",today, ".csv"))))
+cat(sprintf("  Kmer global stability           : %s\n",
+            file.path(output_dir, "tables", paste0("kmer_global_stability_",        today, ".tsv"))))
+cat(sprintf("  Gene kmer stability             : %s\n",
+            file.path(output_dir, "tables", paste0("gene_kmer_stability_",          today, ".tsv"))))
+cat(sprintf("  Motif enrichment (all DEG sets) : %s\n",
+            file.path(output_dir, "tables", paste0("motif_enrichment_all_degsets_", today, ".csv"))))
+cat(sprintf("  Sub-kmer enrichment (all DEG)   : %s\n",
+            file.path(output_dir, "tables", paste0("subkmer_enrichment_all_degsets_",today, ".csv"))))
+cat(sprintf("  Global fastq sensitivity        : %s\n",
+            file.path(output_dir, "tables", paste0("global_fastq_sensitivity_summary_",today, ".csv"))))
+cat(sprintf("  GLMM combined results           : %s\n",
+            file.path(output_dir, "tables", paste0("glmm_combined_across_degsets_", today, ".csv"))))
+cat(sprintf("  GLMM consistency                : %s\n",
+            file.path(output_dir, "tables", paste0("glmm_consistency_perDEG_vs_combined_",today, ".csv"))))
+if (!is.null(fit_full)) {
+  cat(sprintf("  Bayesian model                  : %s\n",
+              file.path(output_dir, "models", paste0("brms_full_",                    today, ".rds"))))
+  cat(sprintf("  Bayesian coefficients           : %s\n",
+              file.path(output_dir, "tables", paste0("brms_coefficients_",            today, ".csv"))))
+}
+cat(sprintf("  Robustness ranking              : %s\n",
+            file.path(output_dir, "diagnostics", paste0("ROBUSTNESS_RANKING_",      today, ".csv"))))
