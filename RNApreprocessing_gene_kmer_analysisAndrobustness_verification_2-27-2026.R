@@ -1572,9 +1572,10 @@ run_analysis <- function(X, y, meta_use, dname, label, ensembl_ids, hgnc_symbols
   ci_high_vec  <- numeric(length(gene_names))
   names(auc_vec) <- names(ci_low_vec) <- names(ci_high_vec) <- gene_names
   
-  pred_store   <- list()
-  boxplot_list <- list()
-  gene_n       <- 0
+  pred_store     <- list()
+  pred_glm_store <- list()   # GLM predictions stored in parallel
+  boxplot_list   <- list()
+  gene_n         <- 0
   
   # ── Null model (age + sex only) LOOCV — computed once, reused per gene ──
   sex_numeric_all  <- ifelse(toupper(meta_use$Sex) == "M", 1, 0)
@@ -1610,6 +1611,7 @@ run_analysis <- function(X, y, meta_use, dname, label, ensembl_ids, hgnc_symbols
   for (g in gene_names) {
     gene_n   <- gene_n + 1
     pred_all <- numeric(n)
+    pred_glm <- numeric(n)
     
     if (var(X[, g]) == 0) {
       auc_vec[g] <- NA; ci_low_vec[g] <- NA; ci_high_vec[g] <- NA
@@ -1636,9 +1638,12 @@ run_analysis <- function(X, y, meta_use, dname, label, ensembl_ids, hgnc_symbols
       y_train <- y[train_idx]
       
       if (var(X_train[, "gene"]) == 0 || length(unique(y_train)) < 2) {
-        pred_all[i] <- 0.5; next
+        pred_all[i] <- 0.5
+        pred_glm[i] <- 0.5
+        next
       }
       
+      # ── glmnet prediction ──────────────────────────────────────────────
       pf <- c(gene = 1, age = 0, sex = 0)
       
       fit_cv <- tryCatch(
@@ -1655,39 +1660,59 @@ run_analysis <- function(X, y, meta_use, dname, label, ensembl_ids, hgnc_symbols
         error = function(e) NULL
       )
       
-      if (is.null(fit_cv)) { pred_all[i] <- 0.5; next }
-      
-      # Check gene coefficient at lambda.min and lambda.1se
-      gene_coef_min <- tryCatch(
-        as.numeric(coef(fit_cv, s = "lambda.min")["gene", ]),
-        error = function(e) 0
-      )
-      gene_coef_1se <- tryCatch(
-        as.numeric(coef(fit_cv, s = "lambda.1se")["gene", ]),
-        error = function(e) 0
-      )
-      
-      # Prefer lambda.min if gene retained; fall back to lambda.1se;
-      # if gene zeroed at both, assign 0.5 — do not let age+sex alone
-      # masquerade as gene-specific accuracy
-      s_use <- if (!is.na(gene_coef_min) && gene_coef_min != 0) {
-        "lambda.min"
-      } else if (!is.na(gene_coef_1se) && gene_coef_1se != 0) {
-        "lambda.1se"
+      if (is.null(fit_cv)) {
+        pred_all[i] <- 0.5
       } else {
-        NA
+        gene_coef_min <- tryCatch(
+          as.numeric(coef(fit_cv, s = "lambda.min")["gene", ]),
+          error = function(e) 0
+        )
+        gene_coef_1se <- tryCatch(
+          as.numeric(coef(fit_cv, s = "lambda.1se")["gene", ]),
+          error = function(e) 0
+        )
+        s_use <- if (!is.na(gene_coef_min) && gene_coef_min != 0) {
+          "lambda.min"
+        } else if (!is.na(gene_coef_1se) && gene_coef_1se != 0) {
+          "lambda.1se"
+        } else {
+          NA
+        }
+        pred_all[i] <- if (is.na(s_use)) 0.5 else tryCatch(
+          as.numeric(predict(fit_cv, newx = X_test, s = s_use, type = "response")),
+          error = function(e) 0.5
+        )
       }
       
-      if (is.na(s_use)) { pred_all[i] <- 0.5; next }
-      
-      pred_all[i] <- tryCatch(
-        as.numeric(predict(fit_cv, newx = X_test, s = s_use, type = "response")),
-        error = function(e) 0.5
+      # ── GLM prediction (unpenalized, for comparison) ───────────────────
+      has_sex_var <- length(unique(sex_train)) > 1
+      df_tr <- data.frame(
+        y    = y_train,
+        gene = X_train[, "gene"],
+        age  = X_train[, "age"],
+        sex  = sex_train
       )
+      df_te <- data.frame(
+        gene = X_test[, "gene"],
+        age  = X_test[, "age"],
+        sex  = sex_test
+      )
+      formula_glm <- if (has_sex_var) y ~ gene + age + sex else y ~ gene + age
+      fit_glm <- tryCatch(
+        suppressWarnings(glm(formula_glm, data = df_tr, family = binomial())),
+        error = function(e) NULL
+      )
+      pred_glm[i] <- if (!is.null(fit_glm)) {
+        tryCatch(
+          as.numeric(predict(fit_glm, newdata = df_te, type = "response")),
+          error = function(e) 0.5
+        )
+      } else 0.5
     }
     
-    # Store completed pred_all after inner loop
-    pred_store[[g]] <- pred_all
+    # Store completed predictions after inner loop
+    pred_store[[g]]     <- pred_all
+    pred_glm_store[[g]] <- pred_glm
     
     roc_g <- tryCatch(
       roc(response = y, predictor = pred_all, quiet = TRUE),
@@ -1705,7 +1730,7 @@ run_analysis <- function(X, y, meta_use, dname, label, ensembl_ids, hgnc_symbols
     
     sym <- if (!is.na(gene_symbols[gene_n])) gene_symbols[gene_n] else g
     
-    # ── Optimal threshold ─────────────────────────────────────────────────
+    # ── Optimal threshold (glmnet) ────────────────────────────────────────
     opt_res          <- find_opt_threshold(pred_all, y)
     opt_thresh       <- opt_res$threshold
     sensitivity_opt  <- opt_res$sensitivity
@@ -1723,7 +1748,6 @@ run_analysis <- function(X, y, meta_use, dname, label, ensembl_ids, hgnc_symbols
     } else {
       sum((pred_all >= opt_thresh) & (y == 0)) / max(1, sum(pred_all >= opt_thresh))
     }
-    
     predicted_class_opt <- if (!thresh_inverted) {
       ifelse(pred_all >= opt_thresh, "AD", "CTRL")
     } else {
@@ -1736,6 +1760,12 @@ run_analysis <- function(X, y, meta_use, dname, label, ensembl_ids, hgnc_symbols
     specificity_05  <- sum((pred_all <  0.5) & (y == 0)) / max(1, sum(y == 0))
     balanced_acc_05 <- (sensitivity_05 + specificity_05) / 2
     correct_05      <- ifelse(pred_all >= 0.5, "AD", "CTRL") == ifelse(y == 1, "AD", "CTRL")
+    
+    # ── GLM stats ─────────────────────────────────────────────────────────
+    glm_opt_res      <- find_opt_threshold(pred_glm, y)
+    glm_balacc_opt   <- glm_opt_res$balacc
+    glm_sens_opt     <- glm_opt_res$sensitivity
+    glm_spec_opt     <- glm_opt_res$specificity
     
     # ── Incremental gain over null model ──────────────────────────────────
     balacc_gain    <- balanced_acc_opt - null_balacc
@@ -1760,6 +1790,7 @@ run_analysis <- function(X, y, meta_use, dname, label, ensembl_ids, hgnc_symbols
       raw_expression = as.numeric(X[, g]),
       adj_expression = as.numeric(adj_expression),
       predicted_prob = pred_all,
+      predicted_glm  = pred_glm,
       actual_diag    = ifelse(y == 1, "AD", "CTRL"),
       group          = as.factor(meta_use[["Diag"]]),
       sex            = as.factor(meta_use$Sex),
@@ -1812,6 +1843,9 @@ run_analysis <- function(X, y, meta_use, dname, label, ensembl_ids, hgnc_symbols
       geom_hline(yintercept = 0.5, linetype = "dotted",
                  color = "grey40", linewidth = 0.5) +
       geom_point(size = 3, alpha = 0.9) +
+      # GLM predictions overlaid as grey crosses
+      geom_point(aes(y = predicted_glm), shape = 3, size = 2,
+                 color = "grey50", alpha = 0.7) +
       annotate("text", x = 1, y = opt_thresh + 0.03,
                label = paste0("Optimal threshold: ", round(opt_thresh, 2)),
                color = "darkgreen", size = 3, hjust = 0) +
@@ -1821,8 +1855,8 @@ run_analysis <- function(X, y, meta_use, dname, label, ensembl_ids, hgnc_symbols
                          name   = "Prediction (optimal threshold)",
                          labels = c("TRUE" = "Correct", "FALSE" = "Wrong")) +
       scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.2)) +
-      labs(title = "C: LOOCV predicted P(AD) per sample",
-           x     = "Sample (ordered by predicted probability)",
+      labs(title = "C: LOOCV predicted P(AD) per sample  [+ = glm]",
+           x     = "Sample (ordered by glmnet predicted probability)",
            y     = "Predicted P(AD)") +
       theme_bw(base_size = 10) +
       theme(
@@ -1842,7 +1876,6 @@ run_analysis <- function(X, y, meta_use, dname, label, ensembl_ids, hgnc_symbols
         summarize(n = n(), .groups = "drop") %>%
         mutate(correct   = actual_diag == predicted_diag,
                threshold = thresh_label)
-      
       all_combos <- expand.grid(
         actual_diag    = c("AD", "CTRL"),
         predicted_diag = c("AD", "CTRL"),
@@ -1857,10 +1890,10 @@ run_analysis <- function(X, y, meta_use, dname, label, ensembl_ids, hgnc_symbols
     
     conf_both <- bind_rows(
       make_conf_df(plot_df$predicted_opt,
-                   paste0("Optimal (", round(opt_thresh, 2), ")\n",
+                   paste0("glmnet Optimal (", round(opt_thresh, 2), ")\n",
                           "BalAcc=", round(balanced_acc_opt * 100, 1), "%")),
       make_conf_df(plot_df$predicted_05,
-                   paste0("Fixed (0.5)\n",
+                   paste0("glmnet Fixed (0.5)\n",
                           "BalAcc=", round(balanced_acc_05 * 100, 1), "%"))
     )
     
@@ -1886,9 +1919,10 @@ run_analysis <- function(X, y, meta_use, dname, label, ensembl_ids, hgnc_symbols
     title_grob <- cowplot::ggdraw() +
       cowplot::draw_label(
         paste0(sym, " (", g, ")",
-               "  |  AUC: ",          round(auc_vec[g], 3),
+               "  |  glmnet AUC: ",   round(auc_vec[g], 3),
                " [", round(ci_low_vec[g], 3), ", ", round(ci_high_vec[g], 3), "]",
-               "  |  BalAcc(opt): ",  round(balanced_acc_opt * 100, 1), "%",
+               "  |  glm BalAcc: ",   round(glm_balacc_opt * 100, 1), "%",
+               "  |  glmnet BalAcc(opt): ", round(balanced_acc_opt * 100, 1), "%",
                "  |  BalAcc(0.5): ",  round(balanced_acc_05  * 100, 1), "%",
                "  |  Sens: ",         round(sensitivity_opt  * 100, 1), "%",
                "  |  Spec: ",         round(specificity_opt  * 100, 1), "%",
@@ -1904,8 +1938,9 @@ run_analysis <- function(X, y, meta_use, dname, label, ensembl_ids, hgnc_symbols
     )
     
     cat("  Gene", gene_n, "/", length(gene_names), ":", sym,
-        "| AUC:", round(auc_vec[g], 3),
-        "| BalAcc(opt):", round(balanced_acc_opt * 100, 1), "%",
+        "| glmnet AUC:", round(auc_vec[g], 3),
+        "| glmnet BalAcc:", round(balanced_acc_opt * 100, 1), "%",
+        "| glm BalAcc:", round(glm_balacc_opt * 100, 1), "%",
         "| Gain over null:", round(balacc_gain * 100, 1), "%",
         if (sex_confounded) "<-- SEX CONFOUNDED" else "", "\n")
   }
@@ -1920,7 +1955,6 @@ run_analysis <- function(X, y, meta_use, dname, label, ensembl_ids, hgnc_symbols
     if (is.null(pred_all) || is.na(auc_vec[g])) return(NA_real_)
     find_opt_threshold(pred_all, y)$balacc
   })
-  
   sort_df <- data.frame(
     g      = names(boxplot_list),
     balacc = balacc_tmp,
@@ -1938,6 +1972,7 @@ run_analysis <- function(X, y, meta_use, dname, label, ensembl_ids, hgnc_symbols
   # ── Build gene summary ────────────────────────────────────────────────────
   gene_summary_rows <- lapply(gene_names, function(g) {
     pred_all <- pred_store[[g]]
+    pred_glm <- pred_glm_store[[g]]
     if (is.null(pred_all) || is.na(auc_vec[g])) return(NULL)
     
     roc_g <- tryCatch(
@@ -1946,6 +1981,7 @@ run_analysis <- function(X, y, meta_use, dname, label, ensembl_ids, hgnc_symbols
     )
     if (is.null(roc_g)) return(NULL)
     
+    # glmnet stats
     opt_res          <- find_opt_threshold(pred_all, y)
     opt_thresh       <- opt_res$threshold
     sensitivity_opt  <- opt_res$sensitivity
@@ -1963,7 +1999,6 @@ run_analysis <- function(X, y, meta_use, dname, label, ensembl_ids, hgnc_symbols
     } else {
       sum((pred_all >= opt_thresh) & (y == 0)) / max(1, sum(pred_all >= opt_thresh))
     }
-    
     predicted_class_opt <- if (!thresh_inverted) {
       ifelse(pred_all >= opt_thresh, "AD", "CTRL")
     } else {
@@ -1976,37 +2011,58 @@ run_analysis <- function(X, y, meta_use, dname, label, ensembl_ids, hgnc_symbols
     balanced_acc_05 <- (sensitivity_05 + specificity_05) / 2
     correct_05      <- ifelse(pred_all >= 0.5, "AD", "CTRL") == ifelse(y == 1, "AD", "CTRL")
     
+    # GLM stats
+    glm_opt_res    <- if (!is.null(pred_glm)) find_opt_threshold(pred_glm, y) else
+      list(threshold = NA, sensitivity = NA, specificity = NA, balacc = NA)
+    roc_glm        <- tryCatch(
+      roc(response = y, predictor = pred_glm, quiet = TRUE),
+      error = function(e) NULL
+    )
+    auc_glm        <- if (!is.null(roc_glm)) as.numeric(auc(roc_glm)) else NA_real_
+    ci_glm         <- if (!is.null(pred_glm) && !is.na(auc_glm)) {
+      bootstrap_auc_ci(y = y, p_hat = pred_glm, B = B_boot, conf = 0.95)
+    } else list(ci_low = NA_real_, ci_high = NA_real_)
+    
     sym            <- hgnc_symbols[match(g, ensembl_ids)]
     sym            <- if (!is.na(sym)) sym else g
     balacc_gain    <- balanced_acc_opt - null_balacc
     sex_confounded <- balacc_gain < 0.02
     
     data.frame(
-      ensembl_id       = g,
-      gene_symbol      = sym,
-      auc              = round(auc_vec[g],       3),
-      ci_low           = round(ci_low_vec[g],    3),
-      ci_high          = round(ci_high_vec[g],   3),
-      opt_threshold    = round(opt_thresh,       3),
-      sensitivity_opt  = round(sensitivity_opt,  3),
-      specificity_opt  = round(specificity_opt,  3),
-      ppv_opt          = round(ppv_opt,          3),
-      npv_opt          = round(npv_opt,          3),
-      balanced_acc_opt = round(balanced_acc_opt, 3),
-      accuracy_opt     = round(mean(correct_opt),3),
-      n_correct_opt    = sum(correct_opt),
-      sensitivity_05   = round(sensitivity_05,   3),
-      specificity_05   = round(specificity_05,   3),
-      balanced_acc_05  = round(balanced_acc_05,  3),
-      accuracy_05      = round(mean(correct_05), 3),
-      n_correct_05     = sum(correct_05),
-      n_total          = length(y),
-      n_AD             = sum(y == 1),
-      n_CTRL           = sum(y == 0),
-      null_balacc      = round(null_balacc,      3),
-      balacc_gain      = round(balacc_gain,      3),
-      sex_confounded   = sex_confounded,
-      stringsAsFactors = FALSE
+      ensembl_id        = g,
+      gene_symbol       = sym,
+      # glmnet metrics
+      auc               = round(auc_vec[g],          3),
+      ci_low            = round(ci_low_vec[g],        3),
+      ci_high           = round(ci_high_vec[g],       3),
+      opt_threshold     = round(opt_thresh,           3),
+      sensitivity_opt   = round(sensitivity_opt,      3),
+      specificity_opt   = round(specificity_opt,      3),
+      ppv_opt           = round(ppv_opt,              3),
+      npv_opt           = round(npv_opt,              3),
+      balanced_acc_opt  = round(balanced_acc_opt,     3),
+      accuracy_opt      = round(mean(correct_opt),    3),
+      n_correct_opt     = sum(correct_opt),
+      sensitivity_05    = round(sensitivity_05,       3),
+      specificity_05    = round(specificity_05,       3),
+      balanced_acc_05   = round(balanced_acc_05,      3),
+      accuracy_05       = round(mean(correct_05),     3),
+      n_correct_05      = sum(correct_05),
+      # GLM metrics
+      auc_glm           = round(auc_glm,              3),
+      ci_low_glm        = round(ci_glm$ci_low,        3),
+      ci_high_glm       = round(ci_glm$ci_high,       3),
+      balacc_opt_glm    = round(glm_opt_res$balacc,   3),
+      sensitivity_glm   = round(glm_opt_res$sensitivity, 3),
+      specificity_glm   = round(glm_opt_res$specificity, 3),
+      # Null/confounding
+      n_total           = length(y),
+      n_AD              = sum(y == 1),
+      n_CTRL            = sum(y == 0),
+      null_balacc       = round(null_balacc,          3),
+      balacc_gain       = round(balacc_gain,          3),
+      sex_confounded    = sex_confounded,
+      stringsAsFactors  = FALSE
     )
   })
   
@@ -2018,9 +2074,12 @@ run_analysis <- function(X, y, meta_use, dname, label, ensembl_ids, hgnc_symbols
             row.names = FALSE)
   
   # ── Build per_gene_df ─────────────────────────────────────────────────────
-  per_gene_df <- gene_summary_df[, c("ensembl_id", "gene_symbol", "auc", "ci_low", "ci_high",
-                                     "balanced_acc_opt", "balanced_acc_05", "opt_threshold",
-                                     "sensitivity_opt", "specificity_opt",
+  per_gene_df <- gene_summary_df[, c("ensembl_id", "gene_symbol",
+                                     "auc",     "ci_low",     "ci_high",
+                                     "auc_glm", "ci_low_glm", "ci_high_glm",
+                                     "balanced_acc_opt", "balanced_acc_05", "balacc_opt_glm",
+                                     "opt_threshold", "sensitivity_opt", "specificity_opt",
+                                     "sensitivity_glm", "specificity_glm",
                                      "null_balacc", "balacc_gain", "sex_confounded")]
   
   per_gene_df_sorted <- per_gene_df[!is.na(per_gene_df$auc), ]
@@ -2036,7 +2095,6 @@ run_analysis <- function(X, y, meta_use, dname, label, ensembl_ids, hgnc_symbols
   )
   
   # ── Top biomarker dot plot ────────────────────────────────────────────────
-  # top20 MUST be defined here, after per_gene_df_sorted is built
   top20            <- head(per_gene_df_sorted, 20)
   top20$confound_label <- ifelse(!is.na(top20$sex_confounded) & top20$sex_confounded,
                                  "Sex confounded", "Gene-specific")
@@ -2044,13 +2102,22 @@ run_analysis <- function(X, y, meta_use, dname, label, ensembl_ids, hgnc_symbols
   
   p_biomarker <- ggplot(top20, aes(y = reorder(gene_symbol, balanced_acc_opt),
                                    color = strength)) +
+    # glmnet AUC + CI (solid circle)
     geom_errorbarh(aes(xmin = ci_low, xmax = ci_high),
                    height = 0.25, linewidth = 0.7) +
     geom_point(aes(x = auc), size = 4, shape = 16) +
+    # glm AUC + CI (dashed, grey triangle)
+    geom_errorbarh(aes(xmin = ci_low_glm, xmax = ci_high_glm),
+                   height = 0.15, linewidth = 0.5, linetype = "dashed",
+                   color = "grey55") +
+    geom_point(aes(x = auc_glm), size = 3, shape = 17, color = "grey45") +
+    # BalAcc: glmnet optimal (filled diamond), glmnet @0.5 (filled square), glm optimal (open diamond)
     geom_point(aes(x = balanced_acc_opt, fill = strength),
                size = 4, shape = 23, color = "grey30") +
     geom_point(aes(x = balanced_acc_05, fill = strength),
                size = 3, shape = 22, color = "grey30") +
+    geom_point(aes(x = balacc_opt_glm),
+               size = 3, shape = 5, color = "grey45") +
     scale_fill_manual(
       values = c("Poor (<0.6)"      = "#d9d9d9",
                  "Fair (0.6-0.7)"   = "#fc8d59",
@@ -2070,16 +2137,19 @@ run_analysis <- function(X, y, meta_use, dname, label, ensembl_ids, hgnc_symbols
     geom_vline(xintercept = 0.7, linetype = "dotted", color = "orange") +
     geom_vline(xintercept = 0.8, linetype = "dotted", color = "red") +
     annotate("text", x = 0.41, y = -Inf,
-             label = "● AUC+CI   ◆ BalAcc(optimal)   ■ BalAcc(0.5)   ✕ sex confounded",
-             hjust = 0, vjust = -0.5, size = 3, color = "grey30") +
+             label = paste0("● glmnet AUC+CI   ▲ glm AUC+CI   ",
+                            "◆ glmnet BalAcc(opt)   ■ glmnet BalAcc(0.5)   ",
+                            "◇ glm BalAcc(opt)   ✕ sex confounded"),
+             hjust = 0, vjust = -0.5, size = 2.8, color = "grey30") +
     scale_color_discrete(name = "AUC strength") +
     scale_x_continuous(limits = c(0.4, 1.0), breaks = seq(0.4, 1.0, 0.1)) +
     labs(
       title    = paste0("Top AD Biomarkers — ", label),
       subtitle = paste0("Null model (age+sex) BalAcc: ", round(null_balacc * 100, 1),
-                        "%  |  ✕ = gene gain < 2% over null"),
+                        "%  |  ✕ = glmnet gain < 2% over null",
+                        "  |  Solid/colour = glmnet   Grey = glm"),
       x        = "Metric value",
-      y        = "Gene (sorted by balanced accuracy)",
+      y        = "Gene (sorted by glmnet balanced accuracy)",
       color    = "AUC strength"
     ) +
     theme_bw(base_size = 11) +
@@ -2193,7 +2263,6 @@ run_analysis <- function(X, y, meta_use, dname, label, ensembl_ids, hgnc_symbols
       width  = max(6, length(top20_genes) * 0.4),
       height = max(5, length(top20_genes) * 0.4)
     )
-    
     if (nrow(coef_df) > 1) {
       sel_genes <- coef_df$feature[coef_df$feature %in% colnames(X)]
       sel_sym   <- coef_df$gene_symbol[coef_df$feature %in% colnames(X)]
@@ -2218,13 +2287,14 @@ run_analysis <- function(X, y, meta_use, dname, label, ensembl_ids, hgnc_symbols
   p_gene_bar <- ggplot(per_gene_df_sorted,
                        aes(x = reorder(gene_symbol, balanced_acc_opt), y = balanced_acc_opt)) +
     geom_col(fill = "tomato", alpha = 0.8) +
-    geom_point(aes(y = auc), color = "steelblue", size = 2) +
+    geom_point(aes(y = auc),          color = "steelblue", size = 2) +
+    geom_point(aes(y = balacc_opt_glm), color = "grey45",  size = 2, shape = 17) +
     geom_hline(yintercept = 0.7, linetype = "dotted", color = "orange") +
     geom_hline(yintercept = 0.8, linetype = "dotted", color = "red") +
     coord_flip() +
     theme_bw(base_size = 10) +
     labs(title    = paste("Per-gene balanced accuracy (bars) + AUC (dots) -", label),
-         subtitle = "Sorted by balanced accuracy at optimal threshold",
+         subtitle = "Bars=glmnet BalAcc(opt)  Blue dot=glmnet AUC  Grey triangle=glm BalAcc(opt)",
          x = "Gene", y = "Metric value")
   
   ggsave(file.path(output_dir, paste0("per_gene_LOOCV_auc_bar_", label, "_", today, ".png")),
@@ -2265,7 +2335,7 @@ run_analysis <- function(X, y, meta_use, dname, label, ensembl_ids, hgnc_symbols
   ggsave(file.path(output_dir, paste0("multigene_bootstrap_auc_hist_", label, "_", today, ".png")),
          p_boot, width = 6, height = 4, dpi = 300)
   
-  # ── Structured comparison: elastic net vs top per-gene ────────────────────
+  # ── Structured comparison: glmnet + glm per-gene vs elastic net ───────────
   needed_cols  <- c("gene_symbol", "auc", "ci_low", "ci_high",
                     "balanced_acc_opt", "balanced_acc_05",
                     "sensitivity_opt", "specificity_opt")
@@ -2273,10 +2343,26 @@ run_analysis <- function(X, y, meta_use, dname, label, ensembl_ids, hgnc_symbols
   if (length(missing_cols) > 0)
     stop("gene_summary_df missing columns: ", paste(missing_cols, collapse = ", "))
   
-  top10_compare <- head(gene_summary_df[order(-gene_summary_df$balanced_acc_opt), ],
-                        10)[, needed_cols]
-  top10_compare$model_type <- "Single gene (LOOCV logistic)"
+  # Top 10 glmnet per-gene
+  top10_glmnet <- head(gene_summary_df[order(-gene_summary_df$balanced_acc_opt), ], 10)[, needed_cols]
+  top10_glmnet$model_type <- "Single gene (glmnet)"
   
+  # Top 10 GLM per-gene (sorted by glm balacc)
+  top10_glm <- head(gene_summary_df[order(-gene_summary_df$balacc_opt_glm), ], 10)
+  top10_glm_compare <- data.frame(
+    gene_symbol      = top10_glm$gene_symbol,
+    auc              = top10_glm$auc_glm,
+    ci_low           = top10_glm$ci_low_glm,
+    ci_high          = top10_glm$ci_high_glm,
+    balanced_acc_opt = top10_glm$balacc_opt_glm,
+    balanced_acc_05  = NA_real_,
+    sensitivity_opt  = top10_glm$sensitivity_glm,
+    specificity_opt  = top10_glm$specificity_glm,
+    model_type       = "Single gene (glm)",
+    stringsAsFactors = FALSE
+  )
+  
+  # Elastic net row
   enet_row <- data.frame(
     gene_symbol      = paste0("Elastic net (", nrow(coef_df), " genes)"),
     auc              = round(auc_multi,             3),
@@ -2290,8 +2376,8 @@ run_analysis <- function(X, y, meta_use, dname, label, ensembl_ids, hgnc_symbols
     stringsAsFactors = FALSE
   )
   
-  comparison_df          <- rbind(top10_compare, enet_row)
-  comparison_df$is_enet  <- comparison_df$model_type == "Elastic net (LOOCV)"
+  comparison_df         <- rbind(top10_glmnet, top10_glm_compare, enet_row)
+  comparison_df$is_enet <- comparison_df$model_type == "Elastic net (LOOCV)"
   
   write.csv(comparison_df,
             file.path(output_dir, paste0("comparison_singlegene_vs_enet_", label, "_", today, ".csv")),
@@ -2309,13 +2395,15 @@ run_analysis <- function(X, y, meta_use, dname, label, ensembl_ids, hgnc_symbols
                size = 3, shape = 22, color = "grey30") +
     scale_color_manual(
       name   = "Model type",
-      values = c("Single gene (LOOCV logistic)" = "steelblue",
-                 "Elastic net (LOOCV)"          = "tomato")
+      values = c("Single gene (glmnet)" = "steelblue",
+                 "Single gene (glm)"    = "grey45",
+                 "Elastic net (LOOCV)"  = "tomato")
     ) +
     scale_fill_manual(
       name   = "Model type",
-      values = c("Single gene (LOOCV logistic)" = "steelblue",
-                 "Elastic net (LOOCV)"          = "tomato"),
+      values = c("Single gene (glmnet)" = "steelblue",
+                 "Single gene (glm)"    = "grey45",
+                 "Elastic net (LOOCV)"  = "tomato"),
       guide  = "none"
     ) +
     annotate("text", x = 0.41, y = -Inf,
@@ -2326,7 +2414,7 @@ run_analysis <- function(X, y, meta_use, dname, label, ensembl_ids, hgnc_symbols
     geom_vline(xintercept = 0.8, linetype = "dotted", color = "red") +
     scale_x_continuous(limits = c(0.4, 1.0), breaks = seq(0.4, 1.0, 0.1)) +
     labs(
-      title    = paste0("Single-gene vs elastic net: AUC & balanced accuracy — ", label),
+      title    = paste0("Single-gene (glmnet + glm) vs elastic net — ", label),
       subtitle = paste0(
         "Enet: AUC=",     round(auc_multi, 3),
         " [",             round(enet_boot_res$ci_low, 3), ", ",
@@ -2347,7 +2435,7 @@ run_analysis <- function(X, y, meta_use, dname, label, ensembl_ids, hgnc_symbols
   ggsave(file.path(output_dir, paste0("comparison_singlegene_vs_enet_", label, "_", today, ".pdf")),
          plot   = p_compare,
          width  = 9,
-         height = max(5, nrow(comparison_df) * 0.45),
+         height = max(5, nrow(comparison_df) * 0.35),
          units  = "in",
          device = cairo_pdf)
   
@@ -2376,10 +2464,10 @@ run_analysis <- function(X, y, meta_use, dname, label, ensembl_ids, hgnc_symbols
   coef_boot_summary <- coef_boot_df %>%
     group_by(feature) %>%
     summarise(
-      coef_mean      = mean(coef,             na.rm = TRUE),
-      coef_ci_low    = quantile(coef, 0.025,  na.rm = TRUE),
-      coef_ci_high   = quantile(coef, 0.975,  na.rm = TRUE),
-      selection_freq = mean(coef != 0,        na.rm = TRUE),
+      coef_mean      = mean(coef,            na.rm = TRUE),
+      coef_ci_low    = quantile(coef, 0.025, na.rm = TRUE),
+      coef_ci_high   = quantile(coef, 0.975, na.rm = TRUE),
+      selection_freq = mean(coef != 0,       na.rm = TRUE),
       .groups = "drop"
     )
   
