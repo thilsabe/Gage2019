@@ -96,4 +96,4 @@ slurm-*.out
 .DS_Store
 Thumbs.db
 
-EOF
+EOF*.fastq.gz
