@@ -530,17 +530,22 @@ compute_jaccard <- function(method_list) {
 # it accounts for kmer-level baseline detectability differences
 # across pipeline methods.
 # ============================================================
-run_glmm_analysis <- function(dt, grouping_type, fixed_value,
-                              deg_name, out_dir, today,
-                              min_rows=100L,
-                              max_bg_ratio=3) {
+library(lme4)
+library(broom.mixed)
+library(data.table)
+
+run_glmm_analysis_lmer4 <- function(dt, grouping_type, fixed_value,
+                                    deg_name, out_dir, today,
+                                    min_rows=100L,
+                                    max_bg_ratio=3) {
   
   if (nrow(dt) < min_rows) {
     cat(sprintf("  [SKIP] GLMM: too few rows (%d < %d)\n", nrow(dt), min_rows))
     return(invisible(NULL))
   }
   
-  required_pkgs <- c("glmmTMB", "broom.mixed", "data.table")
+  # Check required packages
+  required_pkgs <- c("lme4", "broom.mixed", "data.table")
   missing_pkgs  <- required_pkgs[!sapply(required_pkgs, requireNamespace, quietly=TRUE)]
   if (length(missing_pkgs) > 0) {
     cat(sprintf("  [SKIP] GLMM: missing packages: %s\n",
@@ -549,32 +554,27 @@ run_glmm_analysis <- function(dt, grouping_type, fixed_value,
   }
   
   suppressPackageStartupMessages({
-    library(glmmTMB)
+    library(lme4)
     library(broom.mixed)
     library(data.table)
   })
   
-  # ------------------------------------------------------
-  # Basic sanity checks
-  # ------------------------------------------------------
-  
-  if (!"DEG_binary" %in% names(dt) ||
-      length(unique(dt$DEG_binary)) < 2) {
+  # -------------------------------
+  # Sanity checks
+  # -------------------------------
+  if (!"DEG_binary" %in% names(dt) || length(unique(dt$DEG_binary)) < 2) {
     cat("  [SKIP] GLMM: response is constant\n")
     return(invisible(NULL))
   }
-  
   if (!"ensembl_id" %in% names(dt)) {
     cat("  [SKIP] GLMM: ensembl_id missing (required for gene random effect)\n")
     return(invisible(NULL))
   }
   
-  # ------------------------------------------------------
-  # Downsample background (HPC stability)
-  # ------------------------------------------------------
-  
+  # -------------------------------
+  # Downsample background for HPC stability
+  # -------------------------------
   dt <- as.data.table(dt)
-  
   deg_rows <- dt[DEG_binary == 1]
   bg_rows  <- dt[DEG_binary == 0]
   
@@ -586,16 +586,14 @@ run_glmm_analysis <- function(dt, grouping_type, fixed_value,
   }
   
   dt_model_base <- rbind(deg_rows, bg_rows)
-  
   cat(sprintf("  GLMM rows: %d (DEG=%d | BG=%d)\n",
               nrow(dt_model_base),
               sum(dt_model_base$DEG_binary == 1),
               sum(dt_model_base$DEG_binary == 0)))
   
-  # ------------------------------------------------------
+  # -------------------------------
   # Identify varying dimension
-  # ------------------------------------------------------
-  
+  # -------------------------------
   vary_col <- switch(grouping_type,
                      "aligner" = "aligner",
                      "trimmer" = "deg_list_trimmer",
@@ -615,20 +613,16 @@ run_glmm_analysis <- function(dt, grouping_type, fixed_value,
   
   results <- list()
   
-  # ------------------------------------------------------
-  # Helper: fit model safely
-  # ------------------------------------------------------
-  
+  # -------------------------------
+  # Helper: fit model safely with glmer()
+  # -------------------------------
   safe_fit <- function(formula_str, model_name) {
     tryCatch({
-      fit <- glmmTMB(
+      fit <- glmer(
         as.formula(formula_str),
-        data    = dt_model_base,
-        family  = binomial(),
-        control = glmmTMBControl(
-          optimizer = optim,
-          optArgs   = list(method="BFGS")
-        )
+        data = dt_model_base,
+        family = binomial(link = "logit"),
+        control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5))
       )
       
       coefs <- as.data.table(
@@ -642,7 +636,6 @@ run_glmm_analysis <- function(dt, grouping_type, fixed_value,
       
       cat(sprintf("  GLMM %s: AIC=%.1f\n",
                   model_name, AIC(fit)))
-      
       return(coefs)
       
     }, error=function(e) {
@@ -652,72 +645,55 @@ run_glmm_analysis <- function(dt, grouping_type, fixed_value,
     })
   }
   
-  # ------------------------------------------------------
+  # -------------------------------
   # Model 1: Vary dimension only
-  # ------------------------------------------------------
-  
+  # -------------------------------
   if (has_vary) {
     dt_model_base[, vary := as.factor(get(vary_col))]
-    
     formula_str <- "DEG_binary ~ vary + (1 | ensembl_id)"
-    
     results[["vary_only"]] <- safe_fit(
       formula_str,
       paste0(vary_col, "_only")
     )
   }
   
-  # ------------------------------------------------------
+  # -------------------------------
   # Model 2: fastq_trimmer only
-  # ------------------------------------------------------
-  
+  # -------------------------------
   if (has_fastq_trimmer) {
     dt_model_base[, trimmer_f := as.factor(fastq_trimmer)]
-    
     formula_str <- "DEG_binary ~ trimmer_f + (1 | ensembl_id)"
-    
     results[["trimmer_only"]] <- safe_fit(
       formula_str,
       "fastq_trimmer_only"
     )
   }
   
-  # ------------------------------------------------------
+  # -------------------------------
   # Model 3: Additive model
-  # ------------------------------------------------------
-  
+  # -------------------------------
   if (has_vary && has_fastq_trimmer) {
-    
-    formula_str <- paste0(
-      "DEG_binary ~ vary + trimmer_f + (1 | ensembl_id)"
-    )
-    
+    formula_str <- "DEG_binary ~ vary + trimmer_f + (1 | ensembl_id)"
     results[["additive"]] <- safe_fit(
       formula_str,
       paste0(vary_col, "_plus_fastq_trimmer")
     )
   }
   
-  # ------------------------------------------------------
+  # -------------------------------
   # Model 4: Interaction model
-  # ------------------------------------------------------
-  
+  # -------------------------------
   if (has_vary && has_fastq_trimmer) {
-    
-    formula_str <- paste0(
-      "DEG_binary ~ vary * trimmer_f + (1 | ensembl_id)"
-    )
-    
+    formula_str <- "DEG_binary ~ vary * trimmer_f + (1 | ensembl_id)"
     results[["interaction"]] <- safe_fit(
       formula_str,
       paste0(vary_col, "_x_fastq_trimmer")
     )
   }
   
-  # ------------------------------------------------------
+  # -------------------------------
   # Model 5: Full covariate model
-  # ------------------------------------------------------
-  
+  # -------------------------------
   if (has_vary &&
       "kmer_entropy" %in% names(dt_model_base) &&
       "gc_content" %in% names(dt_model_base)) {
@@ -736,12 +712,10 @@ run_glmm_analysis <- function(dt, grouping_type, fixed_value,
     )
   }
   
-  # ------------------------------------------------------
-  # Combine results
-  # ------------------------------------------------------
-  
+  # -------------------------------
+  # Combine results and adjust p-values
+  # -------------------------------
   results <- results[!sapply(results, is.null)]
-  
   if (length(results) == 0) return(invisible(NULL))
   
   combined <- rbindlist(results, fill=TRUE)
@@ -754,8 +728,9 @@ run_glmm_analysis <- function(dt, grouping_type, fixed_value,
   combined[!is.na(p.value) & term != "(Intercept)",
            padj_across_models := p.adjust(p.value, method="BH")]
   
+  # Write results
   fwrite(combined,
-         file.path(deg_out, paste0("glmm_results_", today, ".csv")))
+         file.path(out_dir, paste0("glmm_results_", today, ".csv")))
   
   return(combined)
 }
