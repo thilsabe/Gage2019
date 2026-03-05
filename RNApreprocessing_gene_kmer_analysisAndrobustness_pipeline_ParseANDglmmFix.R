@@ -62,7 +62,7 @@ kmer_features_file <- "kmer_features/kmer_splice_motif_position_features_2026022
 gtf_file           <- "/home/thilsabeck/Documents/genomes/Reference/Homo_sapiens.GRCh38.112.gtf"
 
 # Output paths
-output_dir <- "/netapp/snl/scratch25/AHAllen_projects/Gage2019/FINAL_ALIGNER_KMER_ANALYSIS"
+output_dir <- "/netapp/snl/scratch25/AHAllen_projects/Gage2019/FINAL_ALIGNER_KMER_ANALYSIS_49DEGsets"
 today      <- format(Sys.Date(), "%Y-%m-%d")
 
 for (d in c(output_dir,
