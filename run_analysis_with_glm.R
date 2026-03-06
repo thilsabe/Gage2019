@@ -1,5 +1,5 @@
 run_analysis <- function(X, y, meta_use, dname, label, ensembl_ids, hgnc_symbols,
-                         output_dir, today, alpha_val, B_boot,
+                         output_dir, today, alpha_val, B_boot, B_perm = 1000,
                          gene_chr_map = NULL) {
   
   gene_names   <- colnames(X)
@@ -42,7 +42,7 @@ run_analysis <- function(X, y, meta_use, dname, label, ensembl_ids, hgnc_symbols
     } else 0.5
   }
   null_res    <- find_opt_threshold(pred_null, y)
-  null_balacc <- null_res$balacc
+  null_balacc <- null_res$score
   cat("  Null model (age+sex) BalAcc:", round(null_balacc * 100, 1), "%\n")
   
   # ── Per-gene LOOCV loop ───────────────────────────────────────────────────
@@ -426,6 +426,10 @@ run_analysis <- function(X, y, meta_use, dname, label, ensembl_ids, hgnc_symbols
     balanced_acc_opt <- opt_res$balacc
     thresh_inverted  <- isTRUE(opt_res$inverted)
     
+    # ── Permutation p-value (glmnet) ──────────────────────────────────────────
+    perm_res   <- permutation_pvalue(pred_all, y, B_perm = B_perm)
+    perm_pval  <- perm_res$p_value
+    
     ppv_opt <- if (!thresh_inverted) {
       sum((pred_all >= opt_thresh) & (y == 1)) / max(1, sum(pred_all >= opt_thresh))
     } else {
@@ -490,6 +494,7 @@ run_analysis <- function(X, y, meta_use, dname, label, ensembl_ids, hgnc_symbols
       balanced_acc_05   = round(balanced_acc_05,      3),
       accuracy_05       = round(mean(correct_05),     3),
       n_correct_05      = sum(correct_05),
+      perm_pval         = round(perm_pval, 4),
       # GLM metrics
       auc_glm           = round(auc_glm,              3),
       ci_low_glm        = round(ci_glm$ci_low,        3),
@@ -509,6 +514,14 @@ run_analysis <- function(X, y, meta_use, dname, label, ensembl_ids, hgnc_symbols
   
   gene_summary_df <- do.call(rbind, Filter(Negate(is.null), gene_summary_rows))
   gene_summary_df <- gene_summary_df[order(-gene_summary_df$balanced_acc_opt), ]
+  
+  gene_summary_df$pval_bh_rf   <- p.adjust(gene_summary_df$perm_pval_rf,   method = "BH")
+  gene_summary_df$pval_bh_enet <- p.adjust(gene_summary_df$perm_pval_enet, method = "BH")
+  gene_summary_df$pval_bh_glm  <- p.adjust(gene_summary_df$perm_pval_glm,  method = "BH")
+  # Sig flag: significant in at least one model
+  gene_summary_df$sig_any_bh   <- (gene_summary_df$pval_bh_rf   < 0.05 |
+                                     gene_summary_df$pval_bh_enet < 0.05 |
+                                     gene_summary_df$pval_bh_glm  < 0.05)
   
   write.csv(gene_summary_df,
             file.path(output_dir, paste0("per_gene_summary_", label, "_", today, ".csv")),
@@ -804,6 +817,7 @@ run_analysis <- function(X, y, meta_use, dname, label, ensembl_ids, hgnc_symbols
     model_type       = "Single gene (glm)",
     stringsAsFactors = FALSE
   )
+  rownames(top10_glm_compare) <- top10_glm$ensembl_id
   
   # Elastic net row
   enet_row <- data.frame(
