@@ -111,12 +111,14 @@ tune_rf <- function(df_train, y_train,
 #   - Null model comparison and sex confounding flag
 #   - Comparison plot: glm vs glmnet vs RF per gene + multi-gene RF vs elastic net
 # ═══════════════════════════════════════════════════════════════════════════════
+options(ranger.num.threads = 10)
 run_analysis_rf <- function(X, y, meta_use, dname, label, ensembl_ids, hgnc_symbols,
-                            output_dir, today, alpha_val, B_boot,
+                            output_dir, today, alpha_val, B_boot, B_perm = 1000, 
                             num.trees    = 500,
                             node_grid    = c(1, 3, 5, 10),
                             alpha_grid   = c(0, 0.25, 0.5, 0.75, 1.0),
-                            nfolds_inner = 5) {
+                            nfolds_inner = 5,
+                            gene_chr_map = NULL) {
   
   library(ranger)
   
@@ -226,10 +228,10 @@ run_analysis_rf <- function(X, y, meta_use, dname, label, ensembl_ids, hgnc_symb
         gc_min <- tryCatch(as.numeric(coef(fit_enet, s = "lambda.min")["gene", ]), error = function(e) 0)
         gc_1se <- tryCatch(as.numeric(coef(fit_enet, s = "lambda.1se")["gene", ]), error = function(e) 0)
         s_use  <- if (!is.na(gc_min) && gc_min != 0) "lambda.min" else
-                  if (!is.na(gc_1se) && gc_1se != 0) "lambda.1se" else NA
+          if (!is.na(gc_1se) && gc_1se != 0) "lambda.1se" else NA
         pred_enet[i] <- if (is.na(s_use)) 0.5 else
           tryCatch(as.numeric(predict(fit_enet, newx = X_test_mat,
-                                     s = s_use, type = "response")),
+                                      s = s_use, type = "response")),
                    error = function(e) 0.5)
       } else pred_enet[i] <- 0.5
       
@@ -306,7 +308,6 @@ run_analysis_rf <- function(X, y, meta_use, dname, label, ensembl_ids, hgnc_symb
     glm_opt  <- find_opt_threshold(pred_glm_g, y)
     
     balacc_gain    <- rf_opt$balacc - null_balacc
-    # sex_confounded <- balacc_gain < 0.02
     
     cat("  Gene", gene_n, "/", length(gene_names), ":", sym,
         "| RF AUC:", round(rf_ci$auc, 3),
@@ -315,14 +316,13 @@ run_analysis_rf <- function(X, y, meta_use, dname, label, ensembl_ids, hgnc_symb
         "| glm BalAcc:", round(glm_opt$balacc * 100, 1), "%",
         "| Gain:", round(balacc_gain * 100, 1), "%",
         "| best_alpha:", best_alpha_vec[g],
-        "| best_node:", best_node_vec[g],
-        if (sex_confounded) "<-- SEX CONFOUNDED" else "", "\n")
+        "| best_node:", best_node_vec[g], "\n")
     
     # ── Per-gene 4-panel plot (RF as primary) ─────────────────────────────
     rf_thresh   <- rf_opt$threshold
     rf_inverted <- isTRUE(rf_opt$inverted)
     rf_class    <- if (!rf_inverted) ifelse(pred_rf >= rf_thresh, "AD", "CTRL") else
-                                     ifelse(pred_rf <  rf_thresh, "AD", "CTRL")
+      ifelse(pred_rf <  rf_thresh, "AD", "CTRL")
     rf_correct  <- rf_class == ifelse(y == 1, "AD", "CTRL")
     
     adj_expression <- {
@@ -330,7 +330,7 @@ run_analysis_rf <- function(X, y, meta_use, dname, label, ensembl_ids, hgnc_symb
                             age = as.numeric(meta_use$Age))
       has_sv  <- length(unique(df_full$sex)) > 1
       lm_cov  <- tryCatch(if (has_sv) lm(x ~ sex + age, data = df_full) else
-                            lm(x ~ age, data = df_full), error = function(e) NULL)
+        lm(x ~ age, data = df_full), error = function(e) NULL)
       if (!is.null(lm_cov)) residuals(lm_cov) else df_full$x - mean(df_full$x)
     }
     
@@ -457,7 +457,6 @@ run_analysis_rf <- function(X, y, meta_use, dname, label, ensembl_ids, hgnc_symb
                "  |  glm BalAcc:", round(glm_opt$balacc * 100, 1), "%",
                "  |  Gain:", round(balacc_gain * 100, 1), "%",
                "  |  alpha:", best_alpha_vec[g], "| node:", best_node_vec[g],
-               if (sex_confounded) "  [SEX CONFOUNDED]" else "",
                "  |  ", label),
         fontface = "bold", size = 7.5, x = 0.01, hjust = 0
       )
@@ -473,27 +472,41 @@ run_analysis_rf <- function(X, y, meta_use, dname, label, ensembl_ids, hgnc_symb
     p_rf   <- pred_store_rf[[g]]
     p_enet <- pred_store_enet[[g]]
     p_glm  <- pred_store_glm[[g]]
-    if (is.null(p_rf) || is.na(auc_vec_rf[g])) return(NA_real_)
+    if (is.null(p_rf)) return(NA_real_)
     mean(c(
       find_opt_threshold(p_rf,   y)$balacc,
       find_opt_threshold(p_enet, y)$balacc,
       find_opt_threshold(p_glm,  y)$balacc
     ), na.rm = TRUE)
   })
-  sort_df <- data.frame(g = names(boxplot_list), balacc = balacc_tmp,
-                        auc = auc_vec_rf[names(boxplot_list)], stringsAsFactors = FALSE)
-  sort_df  <- sort_df[order(-sort_df$balacc, -sort_df$auc, na.last = TRUE), ]
+  sort_df <- data.frame(
+    g           = names(boxplot_list),
+    mean_balacc = balacc_tmp,
+    mean_auc    = rowMeans(cbind(auc_vec_rf[names(boxplot_list)],
+                                 auc_vec_enet[names(boxplot_list)],
+                                 auc_vec_glm[names(boxplot_list)]),
+                           na.rm = TRUE),
+    stringsAsFactors = FALSE
+  )
+  sort_df <- sort_df[order(-sort_df$mean_balacc, -sort_df$mean_auc, na.last = TRUE), ]
   pdf(combined_pdf_path, width = 14, height = 10)
   for (g in sort_df$g) print(boxplot_list[[g]])
   dev.off()
   message("Saved ", length(boxplot_list), " gene plots to ", combined_pdf_path)
+  
+  # Calculate permutation-corrected p-values for the best RF model and elastic net for each gene
+  perm_res_rf   <- permutation_pvalue(p_rf,   y, B_perm = B_perm)
+  perm_res_enet <- permutation_pvalue(p_enet, y, B_perm = B_perm)
+  perm_res_glm  <- permutation_pvalue(p_glm,  y, B_perm = B_perm)
   
   # ── Build gene summary ────────────────────────────────────────────────────
   gene_summary_rows <- lapply(gene_names, function(g) {
     p_rf   <- pred_store_rf[[g]]
     p_enet <- pred_store_enet[[g]]
     p_glm  <- pred_store_glm[[g]]
-    if (is.null(p_rf) || is.na(auc_vec_rf[g])) return(NULL)
+    if (is.null(p_rf)) return(NULL)
+    rf_check <- find_opt_threshold(p_rf, y)
+    if (is.na(rf_check$balacc)) return(NULL)
     
     rf_opt   <- find_opt_threshold(p_rf,   y)
     enet_opt <- find_opt_threshold(p_enet, y)
@@ -501,11 +514,15 @@ run_analysis_rf <- function(X, y, meta_use, dname, label, ensembl_ids, hgnc_symb
     
     sym            <- hgnc_symbols[match(g, ensembl_ids)]; sym <- if (!is.na(sym)) sym else g
     balacc_gain    <- rf_opt$balacc - null_balacc
-    sex_confounded <- balacc_gain < 0.02
+    
+    chr_annot  <- if (!is.null(gene_chr_map)) gene_chr_map[g] else NA_character_
+    on_sex_chr <- !is.na(chr_annot) & chr_annot %in% c("X", "chrX", "Y", "chrY")
     
     data.frame(
       ensembl_id        = g,
       gene_symbol       = sym,
+      chromosome        = ifelse(is.na(chr_annot), "unknown", chr_annot),
+      on_sex_chr        = on_sex_chr,
       # RF
       auc_rf            = round(auc_vec_rf[g],    3),
       ci_low_rf         = round(ci_low_rf[g],     3),
@@ -529,10 +546,13 @@ run_analysis_rf <- function(X, y, meta_use, dname, label, ensembl_ids, hgnc_symb
       balacc_opt_glm    = round(glm_opt$balacc,   3),
       sensitivity_glm   = round(glm_opt$sensitivity, 3),
       specificity_glm   = round(glm_opt$specificity, 3),
-      # Null
+      # Permutation Results
+      perm_pval_rf   = round(perm_res_rf$p_value,   4),
+      perm_pval_enet = round(perm_res_enet$p_value, 4),
+      perm_pval_glm  = round(perm_res_glm$p_value,  4),
+      # Null comparison (descriptive)
       null_balacc       = round(null_balacc,      3),
       balacc_gain       = round(balacc_gain,      3),
-      sex_confounded    = sex_confounded,
       n_total           = length(y),
       n_AD              = sum(y == 1),
       n_CTRL            = sum(y == 0),
@@ -541,7 +561,15 @@ run_analysis_rf <- function(X, y, meta_use, dname, label, ensembl_ids, hgnc_symb
   })
   
   gene_summary_df <- do.call(rbind, Filter(Negate(is.null), gene_summary_rows))
-
+  
+  gene_summary_df$pval_bh_rf   <- p.adjust(gene_summary_df$perm_pval_rf,   method = "BH")
+  gene_summary_df$pval_bh_enet <- p.adjust(gene_summary_df$perm_pval_enet, method = "BH")
+  gene_summary_df$pval_bh_glm  <- p.adjust(gene_summary_df$perm_pval_glm,  method = "BH")
+  # Sig flag: significant in at least one model
+  gene_summary_df$sig_any_bh   <- (gene_summary_df$pval_bh_rf   < 0.05 |
+                                     gene_summary_df$pval_bh_enet < 0.05 |
+                                     gene_summary_df$pval_bh_glm  < 0.05)
+  
   # ── Rank by mean BalAcc across all three models ───────────────────────────
   # This is the primary sort key: genes that perform consistently well across
   # all methods rank higher than those that are strong in only one model.
@@ -565,37 +593,38 @@ run_analysis_rf <- function(X, y, meta_use, dname, label, ensembl_ids, hgnc_symb
     order(-gene_summary_df$mean_balacc,
           -gene_summary_df$max_balacc,
           -gene_summary_df$mean_auc), ]
-
+  
   write.csv(gene_summary_df,
             file.path(output_dir, paste0("per_gene_summary_rf_", label, "_", today, ".csv")),
             row.names = FALSE)
-
+  
   # ── per_gene_df_sorted: used for PDF plot ordering and downstream ─────────
   per_gene_df        <- gene_summary_df
-  per_gene_df_sorted <- per_gene_df[!is.na(per_gene_df$auc_rf), ]
-  # Already sorted above; just add RF AUC strength for legend colouring
+  per_gene_df_sorted <- per_gene_df[!is.na(per_gene_df$mean_balacc), ]
+  # Already sorted above by mean_balacc; AUC is retained as tiebreaker
+  # Strength bands based on mean BalAcc — primary metric
   per_gene_df_sorted$strength_rf <- cut(
-    per_gene_df_sorted$auc_rf,
+    per_gene_df_sorted$mean_balacc,
     breaks = c(0, 0.6, 0.7, 0.8, 0.9, 1.0),
     labels = c("Poor (<0.6)", "Fair (0.6-0.7)", "Good (0.7-0.8)",
                "Strong (0.8-0.9)", "Excellent (>0.9)"),
     include.lowest = TRUE
   )
-
+  
   # ── Top-20 by mean BalAcc ─────────────────────────────────────────────────
   top20            <- head(per_gene_df_sorted, 20)
-  top20_confounded <- top20[!is.na(top20$sex_confounded) & top20$sex_confounded, ]
-
+  top20_sex_chr    <- top20[!is.na(top20$on_sex_chr) & top20$on_sex_chr, ]
+  
   # Gene order on y-axis: ascending mean_balacc so best gene is at top
   gene_order <- top20$gene_symbol[order(top20$mean_balacc)]   # low → high
   n_genes    <- length(gene_order)
-
+  
   # Dodge offsets: RF top, glmnet middle, glm bottom within each gene row
   # Row height = 1 unit; models spaced ±0.25 around centre
   model_offset <- c("RF" = 0.25, "glmnet" = 0, "glm" = -0.25)
   model_colors <- c("RF" = "#e41a1c", "glmnet" = "#377eb8", "glm" = "#888888")
   model_shapes <- c("RF" = 16,       "glmnet" = 17,          "glm" = 15)
-
+  
   # Build long data frame with explicit numeric y positions
   make_long_row <- function(gs, model_name, auc, ci_lo, ci_hi, balacc) {
     data.frame(
@@ -610,7 +639,7 @@ run_analysis_rf <- function(X, y, meta_use, dname, label, ensembl_ids, hgnc_symb
       stringsAsFactors = FALSE
     )
   }
-
+  
   top20_long <- do.call(rbind, lapply(seq_len(nrow(top20)), function(i) {
     gs <- top20$gene_symbol[i]
     rbind(
@@ -626,7 +655,7 @@ run_analysis_rf <- function(X, y, meta_use, dname, label, ensembl_ids, hgnc_symb
     )
   }))
   top20_long$model <- factor(top20_long$model, levels = c("RF", "glmnet", "glm"))
-
+  
   # Mean BalAcc reference line per gene (plotted as a thin grey segment)
   top20_mean <- data.frame(
     gene_symbol = top20$gene_symbol,
@@ -634,73 +663,77 @@ run_analysis_rf <- function(X, y, meta_use, dname, label, ensembl_ids, hgnc_symb
     y_centre    = match(top20$gene_symbol, gene_order),
     stringsAsFactors = FALSE
   )
-
-  # Sex-confounded y positions (centre of gene row)
-  confounded_y <- if (nrow(top20_confounded) > 0)
-    match(top20_confounded$gene_symbol, gene_order) else numeric(0)
-
+  
+  # Sex-chromosome gene y positions and labels
+  sex_chr_y      <- if (nrow(top20_sex_chr) > 0)
+    match(top20_sex_chr$gene_symbol, gene_order) else numeric(0)
+  sex_chr_labels <- if (nrow(top20_sex_chr) > 0)
+    top20_sex_chr$chromosome else character(0)
+  
   p_biomarker <- ggplot(top20_long,
                         aes(y = y_pos, color = model, shape = model)) +
-
+    
     # Horizontal reference lines at each gene's integer y (subtle grid)
     geom_hline(data = top20_mean, aes(yintercept = y_centre),
                color = "grey92", linewidth = 0.4, inherit.aes = FALSE) +
-
+    
     # Mean BalAcc tick: thin dark vertical segment per gene
     geom_segment(data = top20_mean,
                  aes(x = mean_balacc, xend = mean_balacc,
                      y = y_centre - 0.42, yend = y_centre + 0.42),
                  color = "grey40", linewidth = 0.5, linetype = "solid",
                  inherit.aes = FALSE) +
-
+    
     # AUC CI bars
     geom_errorbarh(aes(xmin = ci_low, xmax = ci_high),
                    height = 0.10, linewidth = 0.55) +
-
+    
     # AUC point
     geom_point(aes(x = auc), size = 3.2) +
-
+    
     # BalAcc(opt) open diamond — same colour as model, no fill
     geom_point(aes(x = balacc_opt), size = 2.8, shape = 5) +
-
-    # Sex-confounded marker: red ✕ on the RF row of that gene
-    {if (length(confounded_y) > 0)
-      annotate("text", x = 1.005, y = confounded_y + model_offset["RF"],
-               label = "✕", color = "red", size = 3.5, hjust = 0, fontface = "bold")
+    
+    # Sex-chromosome genes: small purple chromosome label (informational, not a penalty)
+    {if (length(sex_chr_y) > 0)
+      annotate("label", x = 0.405, y = sex_chr_y,
+               label = sex_chr_labels,
+               size = 2.4, color = "purple", fill = "white",
+               label.padding = unit(0.10, "lines"), label.size = 0.25)
     } +
-
+    
     scale_color_manual(values = model_colors, name = "Model") +
     scale_shape_manual(values = model_shapes, name = "Model") +
-
+    
     # y-axis: one label per gene at integer positions
     scale_y_continuous(
       breaks = seq_len(n_genes),
       labels = gene_order,
       expand = expansion(add = 0.6)
     ) +
-
+    
     geom_vline(xintercept = 0.5, linetype = "dashed",  color = "grey55", linewidth = 0.5) +
     geom_vline(xintercept = 0.7, linetype = "dotted",  color = "orange", linewidth = 0.6) +
     geom_vline(xintercept = 0.8, linetype = "dotted",  color = "red",    linewidth = 0.6) +
-
-    annotate("text", x = 0.405, y = 0.05,
+    
+    annotate("text", x = 0.435, y = 0.05,
              label = paste0("● AUC + 95% CI   ◇ BalAcc(opt)   ",
-                            "| = mean BalAcc across models   ✕ sex confounded"),
+                            "| = mean BalAcc across models   purple = sex chromosome gene"),
              hjust = 0, vjust = 0, size = 2.6, color = "grey35") +
-
+    
     scale_x_continuous(limits = c(0.4, 1.02), breaks = seq(0.4, 1.0, 0.1)) +
-
+    
     labs(
       title    = paste0("Top 20 AD Biomarkers — RF vs glmnet vs glm — ", label),
       subtitle = paste0(
         "Ranked by mean BalAcc(opt) across all three models",
         "  |  Null (age+sex) BalAcc: ", round(null_balacc * 100, 1), "%",
-        "  |  ✕ = RF gain < 2% over null"
+        "  |  balacc_gain = gene increment over demographic baseline"
       ),
       x     = "Metric value  (AUC ● with CI bars;  BalAcc ◇)",
       y     = "Gene  (ascending mean BalAcc — best at top)"
     ) +
-
+    
     theme_bw(base_size = 11) +
     theme(
       plot.title      = element_text(face = "bold", size = 10),
@@ -790,7 +823,7 @@ run_analysis_rf <- function(X, y, meta_use, dname, label, ensembl_ids, hgnc_symb
   
   # Multi-gene RF stats
   roc_multi_rf  <- tryCatch(roc(response = y, predictor = pred_multi_rf, quiet = TRUE),
-                             error = function(e) NULL)
+                            error = function(e) NULL)
   auc_multi_rf  <- if (!is.null(roc_multi_rf)) as.numeric(auc(roc_multi_rf)) else NA
   boot_multi_rf <- bootstrap_auc_ci(y, pred_multi_rf, B = B_boot, conf = 0.95)
   rf_multi_opt  <- find_opt_threshold(pred_multi_rf, y)
@@ -840,30 +873,34 @@ run_analysis_rf <- function(X, y, meta_use, dname, label, ensembl_ids, hgnc_symb
   # ── Bootstrap histogram (multi-gene RF) ───────────────────────────────────
   boot_df_rf <- data.frame(iteration = seq_along(boot_multi_rf$auc_boot),
                            auc = boot_multi_rf$auc_boot)
-  rf_auc_strength <- cut(auc_multi_rf, breaks = c(0, 0.6, 0.7, 0.8, 0.9, 1.0),
-                         labels = c("Poor", "Fair", "Good", "Strong", "Excellent"),
-                         include.lowest = TRUE)
+  rf_balacc_strength <- cut(rf_multi_opt$balacc, breaks = c(0, 0.6, 0.7, 0.8, 0.9, 1.0),
+                            labels = c("Poor", "Fair", "Good", "Strong", "Excellent"),
+                            include.lowest = TRUE)
   
   p_boot_rf <- ggplot(boot_df_rf, aes(x = auc)) +
     geom_histogram(color = "black", fill = "#e41a1c", alpha = 0.7, bins = 30) +
-    geom_vline(xintercept = auc_multi_rf,         color = "darkred",  linewidth = 1.1) +
+    geom_vline(xintercept = auc_multi_rf,          color = "darkred",  linewidth = 1.1) +
     geom_vline(xintercept = boot_multi_rf$ci_low,  color = "darkred",  linetype = "dashed") +
     geom_vline(xintercept = boot_multi_rf$ci_high, color = "darkred",  linetype = "dashed") +
     geom_vline(xintercept = rf_multi_opt$balacc,   color = "tomato",   linetype = "dashed") +
     geom_vline(xintercept = 0.7,                   color = "orange",   linetype = "dotted") +
     geom_vline(xintercept = 0.8,                   color = "darkred",  linetype = "dotted") +
-    annotate("text", x = auc_multi_rf, y = Inf,
-             label = paste0("AUC=", round(auc_multi_rf, 3), " (", rf_auc_strength, ")"),
-             vjust = 2, hjust = -0.1, color = "darkred", size = 3.5) +
     annotate("text", x = rf_multi_opt$balacc, y = Inf,
-             label = paste0("BalAcc(opt)=", round(rf_multi_opt$balacc, 3)),
-             vjust = 4, hjust = -0.05, color = "tomato", size = 3.2) +
+             label = paste0("BalAcc(opt)=", round(rf_multi_opt$balacc, 3),
+                            " (", rf_balacc_strength, ")"),
+             vjust = 2, hjust = -0.1, color = "tomato", size = 3.5) +
+    annotate("text", x = auc_multi_rf, y = Inf,
+             label = paste0("AUC=", round(auc_multi_rf, 3)),
+             vjust = 4, hjust = -0.1, color = "darkred", size = 3.2) +
     theme_bw(base_size = 10) +
     labs(title = paste0("Multi-gene RF LOOCV — ", label,
+                        "\nBalAcc(opt): ", round(rf_multi_opt$balacc * 100, 1), "%",
+                        " (", rf_balacc_strength, ")",
+                        "  |  Sens: ", round(rf_multi_opt$sensitivity * 100, 1), "%",
+                        "  |  Spec: ", round(rf_multi_opt$specificity * 100, 1), "%",
                         "\nAUC: ", round(boot_multi_rf$mean, 3),
                         " CI [", round(boot_multi_rf$ci_low, 3), ", ",
                         round(boot_multi_rf$ci_high, 3), "]",
-                        "  BalAcc(opt): ", round(rf_multi_opt$balacc * 100, 1), "%",
                         "  best_node=", best_node_multi),
          x = "Bootstrap AUC", y = "Count")
   
@@ -882,6 +919,7 @@ run_analysis_rf <- function(X, y, meta_use, dname, label, ensembl_ids, hgnc_symb
     boot_ci_low_rf      = boot_multi_rf$ci_low,
     boot_ci_high_rf     = boot_multi_rf$ci_high,
     rf_importance       = imp_df,
-    best_node_multi     = best_node_multi
+    best_node_multi     = best_node_multi,
+    top20               = top20          # includes mean_balacc, max_balacc, mean_auc columns
   )
 }
